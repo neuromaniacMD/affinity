@@ -17,7 +17,7 @@ number high.
 | GPU | **One or two AMD RDNA4 `gfx1201` cards.** Radeon AI PRO R9700 (32 GiB) is the reference card; two of them is the design point |
 | Runtime | ROCm 7.x with `hipcc`. Two cards additionally need peer access between them |
 | RAM | 64 GB. The non-resident experts live here; more is better, and on one card it is what makes the model runnable at all |
-| Disk | ~107 GiB container, ~7 GiB draft, plus the source checkpoint |
+| Disk | ~101 GiB container, ~7 GiB draft, plus the source checkpoint |
 | Build | CMake 3.24+, C++20 |
 
 The kernels assume RDNA4 wave32 and its WMMA fragment layout; the configure refuses anything that is
@@ -107,7 +107,7 @@ it works. `--imatrix` is ignored under `--dspark`, which is keyed by target laye
                      --imatrix imatrix/imatrix-v4-flash.dat --threads 12
 ```
 
-Produces 106.6 GiB: 92.9 GiB of routed experts, ~11.6 GiB of dense weights kept in the checkpoint's
+Produces 101.1 GiB: 92.9 GiB of routed experts, ~6.2 GiB of dense weights kept in the checkpoint's
 own FP8, 2.0 GiB of embedding and head. Around three hours at twelve threads. The output is a pure
 function of the checkpoint and the imatrix, so the same inputs give a byte-identical file at any
 `--threads`. It exits non-zero if any expert fails to write, because a partial container loads
@@ -120,7 +120,7 @@ Then the draft, which must share the main container's codebook:
                      --dspark --codebook model.aff
 ```
 
-~6.8 GiB. Skipping it is fine: run with `--dspark off`, which gives the draft's VRAM to the experts.
+~7.0 GiB. Skipping it is fine: run with `--dspark off`, which gives the draft's VRAM to the experts.
 
 | `aff-quantize` | |
 |---|---|
