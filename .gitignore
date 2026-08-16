@@ -1,0 +1,17 @@
+build/
+build-*/
+*.o
+*.so
+*.a
+*.gguf
+*.aff
+*.safetensors
+__pycache__/
+*.pyc
+.venv/
+compile_commands.json
+CMakeUserPresets.json
+bench/config.sh
+traces/
+bench-raw/
+.claude/
