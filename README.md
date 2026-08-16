@@ -4,11 +4,11 @@ An inference engine for DeepSeek-V4-Flash on **one or two** RDNA4 GPUs. Single C
 framework.
 
 The model is 284 B parameters and does not fit in VRAM. At 2.875 bpw its routed experts are ~93 GiB
-against the ~64 GiB two 32 GiB cards give you — half that on one — so on every token some of the
+against the ~64 GiB two 32 GiB cards give you, or half that on one, so on every token some of the
 experts a layer needs are in host RAM. An expert on a card reads at ~630 GB/s; one in host RAM
-crosses PCIe at about a tenth of that. Decode speed is therefore mostly one question — how often is
-the expert this token wants already resident — and the engine is built around moving experts to keep
-that number high.
+crosses PCIe at about a tenth of that. Decode speed is therefore mostly one question: how often is
+the expert this token wants already resident? The engine is built around moving experts to keep that
+number high.
 
 ## Requirements
 
@@ -16,7 +16,7 @@ that number high.
 |---|---|
 | GPU | **One or two AMD RDNA4 `gfx1201` cards.** Radeon AI PRO R9700 (32 GiB) is the reference card; two of them is the design point |
 | Runtime | ROCm 7.x with `hipcc`. Two cards additionally need peer access between them |
-| RAM | 64 GB — the non-resident experts live here; more is better, and on one card it is what makes the model runnable at all |
+| RAM | 64 GB. The non-resident experts live here; more is better, and on one card it is what makes the model runnable at all |
 | Disk | ~107 GiB container, ~7 GiB draft, plus the source checkpoint |
 | Build | CMake 3.24+, C++20 |
 
@@ -30,16 +30,16 @@ are tensor-parallel ranks: every GPU op except the routed experts is split acros
 half of every resident expert, and the two exchange through a peer-push all-reduce.
 
 **One card** is supported and runs the whole model with no collective at all. It is worth having if
-you have the RAM — the experts that do not fit spill to the host pool and then to the container on
-disk. It works, and it is slow: on a 32 GiB card with 64 GB of RAM, roughly 8 tok/s against 110 on
-two cards, because most of the experts end up on disk. More RAM is the fix; the pool is what keeps
-them off the SSD tier.
+you have the RAM, since the experts that do not fit spill to the host pool and then to the container
+on disk. It works, and it is slow: on a 32 GiB card with 64 GB of RAM, roughly 8 tok/s against 110
+on two cards, because most of the experts end up on disk. More RAM is the fix; the pool is what
+keeps them off the SSD tier.
 
 Every `gfx1201` card the runtime reports becomes a rank, so on a machine with exactly one or two
 there is nothing to configure. `--gpus N` caps the count and `HIP_VISIBLE_DEVICES` chooses which.
 
 **Three or more cards is refused at startup.** Nothing in the engine is written for two in
-particular — the rank count is a runtime value throughout, and the pieces that were most likely to
+particular. The rank count is a runtime value throughout, and the pieces that were most likely to
 break are tested past two: the N-way expert split byte-for-byte and arithmetically at four ways, the
 all-reduce bit-identical across ranks at 3, 4 and 8, attention at every per-card head count. The
 engine as a whole still emits degenerate text there, and the cause is not yet known. Refusing beats
@@ -73,7 +73,7 @@ hf download deepseek-ai/DeepSeek-V4-Flash --local-dir ./DeepSeek-V4-Flash
 You need the whole directory: `config.json`, the safetensors shards and `tokenizer.json`. The
 speculative-decode draft is in the same checkpoint (the `mtp.*` tensors), not a separate download.
 
-Then an importance matrix. This is not ours — it is a llama.cpp GGUF imatrix published alongside a
+Then an importance matrix. This is not ours. It is a llama.cpp GGUF imatrix published alongside a
 community GGUF of the same checkpoint:
 
 ```sh
@@ -81,8 +81,8 @@ hf download teamblobfish/DeepSeek-V4-Flash-GGUF imatrix/imatrix-v4-flash.dat --l
 ```
 
 470 MB, calibrated on wikitext (2000 × 512-token chunks). Any llama.cpp imatrix for this model works
-as long as it carries **per-expert** `in_sum2` and `counts` — for MoE tensors llama.cpp writes one
-row per expert, and both jobs below need that per-expert form rather than a tensor-wide average.
+as long as it carries **per-expert** `in_sum2` and `counts`. For MoE tensors llama.cpp writes one row
+per expert, and both jobs below need that per-expert form rather than a tensor-wide average.
 
 It does two jobs, and it is honest to say both are modest.
 
@@ -93,7 +93,7 @@ itself measures. This is the job that justifies the download.
 
 **Its activation counts become the container's expert-popularity profile**, which the placement
 engine ranks against to choose which experts start resident. Against no profile at all that is worth
-1.2 points of hit rate — imatrix popularity is not decode popularity, the calibration corpus is not
+1.2 points of hit rate. Imatrix popularity is not decode popularity, the calibration corpus is not
 your workload, and the heat engine re-ranks from real routing within a few dispatches regardless. It
 is a warm start, not a policy, and `--expert-profile` overrides it with one fitted from real traces.
 
@@ -120,7 +120,7 @@ Then the draft, which must share the main container's codebook:
                      --dspark --codebook model.aff
 ```
 
-~6.8 GiB. Skipping it is fine — run with `--dspark off`, which gives the draft's VRAM to the experts.
+~6.8 GiB. Skipping it is fine: run with `--dspark off`, which gives the draft's VRAM to the experts.
 
 | `aff-quantize` | |
 |---|---|
@@ -150,7 +150,7 @@ up automatically.
 If output looks wrong, `aff-gpucheck -m model.aff` runs the GPU expert path against the CPU
 reference on the real container.
 
-On a terminal both modes draw a live view — per-card utilisation and VRAM, throughput, draft
+On a terminal both modes draw a live view: per-card utilisation and VRAM, throughput, draft
 acceptance, and the expert plane coloured by tier. Piped or redirected it prints ordinary lines
 instead, unchanged. `--ui plain` forces lines on a terminal; `--ui dash` fails rather than downgrade.
 
@@ -167,16 +167,16 @@ instead, unchanged. `--ui plain` forces lines on a terminal; `--ui dash` fails r
 | `--gpus N` | [0 = every supported card] Tensor-parallel ranks, 1 or 2. `HIP_VISIBLE_DEVICES` chooses which cards; this takes a prefix of them |
 | `--dspark on\|off` | [on] Speculative decode. Off does not load the draft and gives its VRAM to the experts; the text differs between the two |
 | `--dspark-model FILE` | [`<model>.dspark.aff`] |
-| `--dspark-placement vram\|ram` | [vram] `ram` pools the draft's slab. A trade, not a saving — the draft rereads its experts several times a block |
+| `--dspark-placement vram\|ram` | [vram] `ram` pools the draft's slab. A trade, not a saving: the draft rereads its experts several times a block |
 | `--gpu-mib M` | Cap on VRAM per card for the expert slabs. Default exceeds any card, so free VRAM binds |
 | `--host-pool-mib M` | RAM for the non-VRAM experts [from MemAvailable]. Pin it for anything you compare |
 | `--gpu-headroom-mib M` | [0 = derive] VRAM the slab leaves alone. Too small and the slab's own allocation fails |
 | `--host-pool-reserve-mib M` | [1536] RAM left free when auto-sizing. What does not fit the pool falls to SSD, and a layer with even one expert on SSD reverts to the slower host dispatch |
-| `--kv-size N` | [1048576] KV positions. Address space, not VRAM — lowering it does not buy residency |
+| `--kv-size N` | [1048576] KV positions. Address space, not VRAM; lowering it does not buy residency |
 | `--kv-commit N` | [65536] Positions actually backed at load. The rest costs nothing until reached, and the difference goes to the expert slab |
 | `--kv-margin N` | [16384] How far ahead the grower keeps the cache backed |
 
-**Prefix cache** — keeps served attention state on SSD so an agent session does not re-prefill its
+**Prefix cache.** Keeps served attention state on SSD so an agent session does not re-prefill its
 whole transcript every turn.
 
 | | |
@@ -225,7 +225,7 @@ whole transcript every turn.
 | `--placement-shadow N` | [32] Spare slab slots for in-flight promotions |
 | `--keepalive-us U` | [0 = off] Per-card heartbeat |
 
-**Diagnostics** — several of these deliberately produce output that is not the model's.
+**Diagnostics.** Several of these deliberately produce output that is not the model's.
 
 | | |
 |---|---|
@@ -244,18 +244,18 @@ whole transcript every turn.
 
 | | |
 |---|---|
-| `AFF_PROFILE=1` | Per-phase breakdown. **Not a passive observer** — it restores a readback and the drain behind it, which changes the mover's slot supply. Do not compare a profiled run against an unprofiled one |
+| `AFF_PROFILE=1` | Per-phase breakdown. **Not a passive observer.** It restores a readback and the drain behind it, which changes the mover's slot supply. Do not compare a profiled run against an unprofiled one |
 | `AFF_BLOCK=1` | The host blocking table alone, without that readback |
 | `AFF_FORCE_RESIDENT=1` | Restrict routing to resident experts. Measures the all-resident ceiling; the output is wrong on purpose |
 | `AFF_TRACE=dense[,events][,deep][,sync][,evsync]` | Per-entry-point device timing |
-| `AFF_MOVER_DUP=K` / `AFF_MOVER_DUP_DIR=both\|h2d\|d2h` | Re-issue each mover copy K times. Same decisions and same text, K times the link bytes — prices a move without changing what the engine does |
+| `AFF_MOVER_DUP=K` / `AFF_MOVER_DUP_DIR=both\|h2d\|d2h` | Re-issue each mover copy K times. Same decisions and same text, K times the link bytes. Prices a move without changing what the engine does |
 | `AFF_XRANK_INJECT=N` | Perturb one rank's cross-rank digest, so the check comparing the cards can be shown to fire |
 
 ## How it works
 
 Every routed expert is in one of three places: a flat per-card **VRAM slab**, a pinned **host pool**,
 or left in the container's mmap on **SSD**. A missing expert is not copied into VRAM and then
-multiplied — the GEMM reads it straight out of host memory over PCIe while it runs, so the transfer
+multiplied. The GEMM reads it straight out of host memory over PCIe while it runs, so the transfer
 is inside the kernel rather than in front of it. The SSD tier is a cliff; size `--host-pool-mib` to
 avoid it.
 
@@ -266,7 +266,7 @@ clears the two guards. The ranking is global rather than per layer: a slab slot 
 so capacity moves to the layers that need it.
 
 Two things about that are not obvious. A swap moves two shards and a miss moves one, and the two
-PCIe directions share one budget, so a promotion has to repay about 1.4 future hits — which is why
+PCIe directions share one budget, so a promotion has to repay about 1.4 future hits, which is why
 total link traffic is U-shaped in `--placement-min-gain`. And what usually limits the mover is not
 the policy but slot supply: a freed slot returns to the free list only when its quarantine event
 signals, and that event is on the compute stream, so an unbounded host lead leaves the mover with
@@ -284,7 +284,7 @@ checked on the device.
 
 - DeepSeek-V4-Flash only. The geometry is compiled in; there is no architecture abstraction.
 - One or two cards; more is refused at startup. See Requirements.
-- Batch 1–4, latency-first. No continuous batching and no paged scheduler — batching an MoE that
+- Batch 1 to 4, latency-first. No continuous batching and no paged scheduler: batching an MoE that
   reads weights from host RAM makes the tokens in a batch pay for the union of their experts.
 - Throughput depends heavily on the prompt, because which experts a token routes to decides how much
   host memory the step reads. Two prompts differ by more than most code changes do, so compare
