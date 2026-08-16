@@ -100,7 +100,7 @@ private:
   void serve_one(int fd);
   int listen_fd_ = -1;
   uint16_t port_ = 0;
-  std::string model_name_ = "affinity";
+  std::string model_name_ = "DeepSeek-V4-Flash";
   // The generator closes over one engine: one KV cache, one set of scratch buffers. Threads are per
   // connection, so without this two requests interleave inside that state and both come out fluent
   // and wrong. Serving is one request at a time by construction; the rest queue here.

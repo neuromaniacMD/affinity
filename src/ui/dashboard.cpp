@@ -212,12 +212,20 @@ void graph(Canvas& c, int x, int y, int w, int h, const std::vector<float>& v, f
   }
 }
 
-// The expert plane. Layers down, experts across, two layers per text row via the upper half block —
-// 43 layers in 22 rows, which fits a pane that also has to hold everything else.
-void heatplane(Canvas& c, int x, int y, int w, int h, const std::vector<float>& heat,
-               const std::vector<uint8_t>& tier, int L, int E) {
-  if (w <= 0 || h <= 0 || L <= 0 || E <= 0) return;
-  if ((int)tier.size() < L * E) return;
+// The expert plane. Layers down, experts across, ONE EXPERT PER HALF-CELL: nothing is aggregated.
+//
+// It used to reduce a rectangle of experts into each cell, heat by max and tier by the most
+// expensive present. Those are two independent reductions, so a cell took its brightness from one
+// expert and its hue from another, and at 256 experts across a normal-width pane almost every cell
+// covered both a hot resident expert and a cold pooled one. The plane then showed a host-RAM tier
+// lit up permanently, which is a claim about placement that the underlying numbers never made.
+//
+// A layer's experts wrap across `strips` half-rows and two half-rows share a text row through the
+// upper half block, so the layer axis stays aligned. Returns how many layers fitted.
+int heatplane(Canvas& c, int x, int y, int w, int h, const std::vector<float>& heat,
+              const std::vector<uint8_t>& tier, int L, int E) {
+  if (w <= 0 || h <= 0 || L <= 0 || E <= 0) return 0;
+  if ((int)tier.size() < L * E) return 0;
   // Static placement keeps no heat plane, and there is nothing dishonest about saying so by drawing
   // every cell at one brightness: the map is then purely where the bytes are, which is the whole of
   // what that configuration decides.
@@ -227,45 +235,40 @@ void heatplane(Canvas& c, int x, int y, int w, int h, const std::vector<float>& 
   for (float f : heat) hmax = std::max(hmax, f);
   if (hmax <= 0) hmax = 1;
 
+  // Wrap onto the narrowest even split rather than the full pane width: at 200 columns a layer
+  // needs two half-rows either way, and 2x128 wastes nothing where 200+56 wastes a third of the
+  // second row.
+  const int strips = (E + w - 1) / w;
+  const int cols = (E + strips - 1) / strips;
   const int half_rows = h * 2;
-  auto cell = [&](int lrow, int col, Rgb* out) -> bool {
-    // Each screen cell covers a rectangle of the plane. Heat aggregates by MAX and the tier by the
-    // most expensive one present: a cell holding one pooled expert among fifteen resident ones is
-    // a cell that costs a link read, and an average would hide exactly that.
-    const int l0 = (int)((int64_t)lrow * L / half_rows);
-    int l1 = (int)((int64_t)(lrow + 1) * L / half_rows);
-    if (l1 <= l0) l1 = l0 + 1;
-    if (l0 >= L) return false;
-    const int e0 = (int)((int64_t)col * E / w);
-    int e1 = (int)((int64_t)(col + 1) * E / w);
-    if (e1 <= e0) e1 = e0 + 1;
-    float best = 0;
-    uint8_t worst = kTierVram;
-    for (int l = l0; l < l1 && l < L; ++l)
-      for (int e = e0; e < e1 && e < E; ++e) {
-        const size_t k = (size_t)l * (size_t)E + (size_t)e;
-        if (has_heat) best = std::max(best, heat[k]);
-        worst = std::max(worst, tier[k]);
-      }
+
+  auto cell = [&](int hrow, int col, Rgb* out) -> bool {
+    const int l = hrow / strips;
+    if (l >= L) return false;
+    const int e = (hrow % strips) * cols + col;
+    if (e >= E) return false;
+    const size_t k = (size_t)l * (size_t)E + (size_t)e;
     // Compressed rather than linear: the heat distribution is long-tailed, and on a linear ramp
     // every expert but the few hottest renders as the darkest step. The exponent is above a square
-    // root because five stops already resolve the low end — sqrt on top of them lifts the whole
+    // root because five stops already resolve the low end; sqrt on top of them lifts the whole
     // plane into the bright half and throws away the contrast the stops were added for.
     const double t =
-        has_heat ? std::pow(std::min(1.0, (double)best / (double)hmax), 0.7) : 0.5;
-    const Rgb* r = worst == kTierSsd ? kSsdRamp : worst == kTierPool ? kPoolRamp : kVramRamp;
+        has_heat ? std::pow(std::min(1.0, (double)heat[k] / (double)hmax), 0.7) : 0.5;
+    const uint8_t tr = tier[k];
+    const Rgb* r = tr == kTierSsd ? kSsdRamp : tr == kTierPool ? kPoolRamp : kVramRamp;
     *out = ramp(r, kTierStops, t);
     return true;
   };
 
   for (int cy = 0; cy < h; ++cy)
-    for (int cx = 0; cx < w; ++cx) {
+    for (int cx = 0; cx < cols; ++cx) {
       Rgb up = kPanel, dn = kPanel;
       const bool a = cell(cy * 2, cx, &up);
       const bool b = cell(cy * 2 + 1, cx, &dn);
       if (!a && !b) continue;
       c.put(x + cx, y + cy, U'▀', a ? up : kPanel, b ? dn : kPanel);
     }
+  return std::min(L, half_rows / strips);
 }
 
 // ---- the console pane ---------------------------------------------------------------------------
@@ -666,7 +669,6 @@ void Dashboard::Impl::panel_device(int x, int y, int w, int h, size_t i) {
   if (v.sclk_mhz > 0) add(fmt("%.0f MHz", v.sclk_mhz));
   if (v.temp_c > 0) add(fmt("%.0f °C", v.temp_c));
   if (v.power_w > 0) add(fmt("%.0f W", v.power_w));
-  if (d.cus) add(fmt("%d CU", d.cus));
   if (h >= 5) canvas.text_clip(ix, y + h - 2, iw, foot, kMuted, kPanel);
 }
 
@@ -782,11 +784,16 @@ void Dashboard::Impl::panel_tab(const Snapshot& s, int x, int y, int w, int h) {
       return;
     }
     const int legend = 1;
-    heatplane(canvas, ix, y + 1, iw, ih - legend, s.heat, s.tier, (int)s.n_layer, (int)s.n_expert);
+    const int shown = heatplane(canvas, ix, y + 1, iw, ih - legend, s.heat, s.tier,
+                                (int)s.n_layer, (int)s.n_expert);
+    const bool clipped = shown < (int)s.n_layer;
     const int ly = y + ih;
     int cx = canvas.text(ix, ly, "layer 0", kMuted, kPanel);
     cx = canvas.text(cx + 1, ly, "→", kFaint, kPanel);
-    cx = canvas.text(cx + 1, ly, fmt("%u", s.n_layer - 1), kMuted, kPanel);
+    // The last layer DRAWN, not the last that exists: the plane never aggregates, so a pane too
+    // small for every layer shows fewer rather than a coarser version of all of them.
+    cx = canvas.text(cx + 1, ly, fmt("%d", shown > 0 ? shown - 1 : 0),
+                     clipped ? kAmber : kMuted, kPanel);
     // Each swatch is the tier's ramp in miniature rather than one block of its brightest stop: the
     // plane encodes two things in one colour, and a three-step swatch says so without a sentence.
     auto swatch = [&](const Rgb* r, const char* label) {
@@ -798,10 +805,12 @@ void Dashboard::Impl::panel_tab(const Snapshot& s, int x, int y, int w, int h) {
     swatch(kVramRamp, " vram  ");
     swatch(kPoolRamp, " host ram  ");
     swatch(kSsdRamp, " ssd");
-    canvas.text_clip(cx + 3, ly, x + w - 2 - cx - 3,
-                     s.heat.empty() ? "static placement: no heat plane, so only the tier is shown"
-                                    : "brightness is how often the router picked it",
-                     kFaint, kPanel);
+    const std::string note =
+        clipped ? fmt("%d of %u layers fit; a taller or wider terminal shows the rest",
+                      shown, s.n_layer)
+        : s.heat.empty() ? std::string("static placement: no heat plane, so only the tier is shown")
+                         : std::string("brightness is how often the router picked it");
+    canvas.text_clip(cx + 3, ly, x + w - 2 - cx - 3, note, clipped ? kAmber : kFaint, kPanel);
     return;
   }
 

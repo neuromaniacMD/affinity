@@ -2088,7 +2088,11 @@ int main(int argc, char** argv) {
   }
 
   Server srv;
-  srv.set_model_name("affinity");
+  // The MODEL, not the engine. A client picks a model by this string and routes on it, so naming
+  // the server here made every deployment claim to serve something called "affinity" and made two
+  // engines serving the same weights look like two different models. `owned_by` is where the engine
+  // belongs, and that still says affinity.
+  srv.set_model_name("DeepSeek-V4-Flash");
   // The container's own encoder, not a hand-rolled template: this release ships no Jinja
   // chat_template and points at `encoding/` instead. src/engine/chat_encode.cpp transcribes it and
   // tests/test_chat_encode.cpp holds it to the container's fixtures byte for byte.
