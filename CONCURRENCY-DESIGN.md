@@ -85,3 +85,55 @@ contribution than a batching fork.
 1. `AFF_PROFILE=1` / `AFF_BLOCK=1` decode breakdown (~10 min, lane down ~3 min) → localise F.
 2. If F is launch/sync-dominated: prototype HIP graph capture for the decode step.
 3. Revisit slot-based batching only if aggregate throughput is still the binding constraint.
+
+---
+
+## 6. PROFILE RESULTS (2026-08-17) — §5 was WRONG, corrected here
+
+Ran `AFF_PROFILE=1` and `AFF_BLOCK=1` (4K prompt, -n 64, 512K matched KV).
+
+**§5's premise was a profiler artifact.** `AFF_PROFILE=1` reported
+`router_topk (stream sync)` = 40 calls/token, 21.5 ms/token, "65.7% route + drain". But
+`model.cpp:1577` reads `const bool dev_plan = ddp_ && ddp_(ddp_ctx_, l) && !prof_on` — **the
+profiler disables the device-built dispatch** so its census can walk the selection, manufacturing
+the very drain it reports. The engine's help says exactly this ("AFF_BLOCK … without AFF_PROFILE's
+readback, which would force the drain it measures"). The author already implemented the
+optimisation: a null `sel` deletes the D2H *and* the drain.
+
+**The unperturbed `AFF_BLOCK=1` decode table** (30.57 t/s = 32.7 ms/token):
+
+| site | calls | total ms | ms/token |
+|---|---:|---:|---:|
+| head (stream sync) | 64 | 137.06 | 2.14 |
+| ncomp_ring (event) | 11,008 | 2.28 | 0.04 |
+| route_ring (event) | 2,752 | 0.64 | 0.01 |
+| begin / router_hash | 448 | 0.12 | ~0 |
+| **total blocked** | | **~140** | **2.19 (6.7%)** |
+
+`router_topk` **does not appear at all**. So decode is **~93% device compute, ~7% host blocking**.
+There is no launch/sync overhead to reclaim — **HIP graph capture would buy almost nothing.**
+
+**Where the time actually goes.** The GEMM census reports ~612,512 MiB of decode-shaped weight
+reads over 64 tokens = **9.35 GiB/token** (2.34 GiB/card). At 32.7 ms/token that is
+**~72 GB/s/card — roughly 11% of the R9700's bandwidth.** Decode is neither host-bound nor
+bandwidth-bound: it is **fixed-cost / occupancy bound at batch 1**, the classic matvec regime
+(no reuse, small kernels, per-layer collectives, plus the Q2P875 codebook decode per weight).
+
+Refitting `step(B) = F + B·m` on clean data (dspark off 32.7 ms/token; dspark on 45.1 ms/block for
+a 6-wide verify + 5 draft passes, draft ≈1.2 ms): **F ≈ 31.4 ms, m ≈ 1.28 ms/token — 96% of a
+batch-1 step is fixed.**
+
+**Conclusion: more tokens per step is the only lever, and it is the one that works.** That is
+precisely what DSpark does (6-wide → 1.76–3.12×) and what sequence batching would extend:
+
+| N slots | ctx/slot | aggregate | vs today | per-request |
+|---:|---:|---:|---:|---:|
+| 1 (today) | 512K | ~90 t/s | 1.00× | ~90 |
+| 2 | 256K | ~134 | ~1.5× | ~67 |
+| 4 | 128K | ~183 | ~2.1× | ~46 |
+| 8 | 64K | ~224 | ~2.6× | ~28 |
+
+Revised recommendation: **§5's "reduce F via graph capture" is dead** — F is device-side, not host.
+Slot-based batching (M1+M2+M3) is the remaining lever. Its throughput payoff is moderate (~1.5×
+at N=2), so the case rests more on **latency isolation** — two agents served without
+head-of-line blocking — than on aggregate tokens/s.
