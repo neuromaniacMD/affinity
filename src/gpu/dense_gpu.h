@@ -446,6 +446,24 @@ private:
   std::atomic<bool> kv_grow_run_{false};
   std::thread kv_grow_;
   std::string kv_grow_err_;
+  // ---- sequence slots ---------------------------------------------------------------------
+  // How many independent sequences the device state holds, and which one the current call acts
+  // on. Every per-sequence buffer in Impl::Dev is slot-major. n_slots_ == 1 is the historical
+  // single-sequence engine, bit-for-bit: the slot dimension is then a vector of one.
+  uint32_t n_slots_ = 1;
+  uint32_t slot_ = 0;
+
+ public:
+  uint32_t n_slots() const { return n_slots_; }
+  // Set BEFORE any call that touches sequence state. Refuses out of range rather than wrapping,
+  // because a silently-wrong slot is another sequence's KV.
+  bool set_slot(uint32_t s) { if (s >= n_slots_) return false; slot_ = s; return true; }
+  uint32_t slot() const { return slot_; }
+  // Called once, before init(): the slot count is a load-time property because every per-slot
+  // buffer is sized from it.
+  bool set_n_slots(uint32_t n) { if (!n || n > 16) return false; n_slots_ = n; return true; }
+
+ private:
   int64_t  a_idx_layer_ = -1;        // the layer whose admissions a_allow/a_adm hold, for the
                                      // CURRENT decode token only; hc_seed invalidates it
   int64_t  b_idx_layer_ = -1;        // batch twin: the layer whose admissions b_allow/b_adm/b_admn

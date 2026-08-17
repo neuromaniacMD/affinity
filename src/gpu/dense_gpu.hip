@@ -301,20 +301,23 @@ struct DenseGpu::Impl {
     float* d_qrn = nullptr;   uint32_t d_qrn_cap = 0;
 
     // ---- attention, replicated cache and this rank's half of the heads -------------------------
-    std::vector<uint8_t*> a_raw, a_comp;
+    // ---- PER-SEQUENCE state, one set per SLOT (see --slots). Slot-major so a slot is a
+    // contiguous, independently allocated sequence: its own KV ring, compressed cache, indexer
+    // key cache and compressor window. Everything else in Dev is shared model state.
+    std::vector<std::vector<uint8_t*>> a_raw_s, a_comp_s;
     // The compressed cache is reserved for the whole context the engine can serve and backed only
     // as far as the sequence has actually reached. `a_comp[l]` is the span's base and never moves,
     // so every kernel keeps its linear addressing. See gpu/vmem.h for why this and not paging.
-    std::vector<VirtualSpan> a_comp_span;
+    std::vector<std::vector<VirtualSpan>> a_comp_span_s;
     hipStream_t a_kv_zero = nullptr;   // shared by every span on this card; see attn_init
     std::vector<float*>   a_sink;
     // The indexer's compressed keys as the scoring kernel wants them: E4M3 rows with one f32 scale
     // each, written once when the compressor emits them.
-    std::vector<uint8_t*> a_idx8;
-    std::vector<float*>   a_idxs;
+    std::vector<std::vector<uint8_t*>> a_idx8_s;
+    std::vector<std::vector<float*>>   a_idxs_s;
     // The compressor's cross-chunk window, per layer: kCompHist raw positions of each projection,
     // indexed by `position & 7`.
-    std::vector<float*>   c_hkv, c_hsc, ci_hkv, ci_hsc;
+    std::vector<std::vector<float*>>   c_hkv_s, c_hsc_s, ci_hkv_s, ci_hsc_s;
     std::vector<uint32_t> c_ratio;      // the ring size follows from it, so it is remembered
     // Per-layer constants, uploaded on the layer's first chunk and kept.
     std::vector<float*>   c_ape, c_norm, ci_ape, ci_norm;
@@ -542,8 +545,8 @@ DenseGpu::~DenseGpu() {
     for (float* p : D.vec) if (p) (void)hipFree(p);
     for (uint16_t* p : D.router) if (p) (void)hipFree(p);
     for (float* p : D.rbias) if (p) (void)hipFree(p);
-    for (uint8_t* p : D.a_raw) if (p) (void)hipFree(p);
-    for (uint8_t* p : D.a_comp) if (p) (void)hipFree(p);
+    for (auto& v : D.a_raw_s)  for (uint8_t* p : v) if (p) (void)hipFree(p);
+    for (auto& v : D.a_comp_s) for (uint8_t* p : v) if (p) (void)hipFree(p);
     for (float* p : D.c_pend) if (p) (void)hipFree(p);
     if (D.c_py) (void)hipFree(D.c_py);
     for (float* p : D.a_sink) if (p) (void)hipFree(p);
@@ -636,6 +639,15 @@ bool DenseGpu::init(uint64_t max_rows, uint64_t max_cols, std::string* err, size
 
   impl_ = new Impl();
   impl_->dev.resize(use);
+  // Every per-sequence vector is slot-major; give each its outer dimension before anything
+  // indexes [slot_]. n_slots_ is 1 unless --slots raised it.
+  for (auto& D : impl_->dev) {
+    D.a_raw_s.resize(n_slots_);   D.a_comp_s.resize(n_slots_);
+    D.a_comp_span_s.resize(n_slots_);
+    D.a_idx8_s.resize(n_slots_);  D.a_idxs_s.resize(n_slots_);
+    D.c_hkv_s.resize(n_slots_);   D.c_hsc_s.resize(n_slots_);
+    D.ci_hkv_s.resize(n_slots_);  D.ci_hsc_s.resize(n_slots_);
+  }
   for (size_t d = 0; d < use; ++d) {
     impl_->dev[d].id = plan[d];
     AFF_HIP_CHECK(hipSetDevice(plan[d]));
@@ -1960,7 +1972,7 @@ bool DenseGpu::kv_commit(uint32_t layer, uint32_t pos, uint32_t width, uint32_t 
   // A refusal here has to clear the deferral too. attn_kv already tested everything below except
   // the layer bound, but a pending flag surviving a refusal would hand the NEXT kv_commit a
   // kvn_src_ from the wrong layer — a stale pointer that still dereferences.
-  if (!attn_ok_ || layer >= impl_->dev[0].a_raw.size() || !a_ring_) { kvn_pending_ = false; return false; }
+  if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size() || !a_ring_) { kvn_pending_ = false; return false; }
   // The cache was sized from a_rot_ at init; committing against a different tail would write rows
   // the attend kernel then reads with the wrong stride.
   if (width != a_width_ || n_rot != a_rot_) { kvn_pending_ = false; return false; }
@@ -1980,7 +1992,7 @@ bool DenseGpu::kv_commit(uint32_t layer, uint32_t pos, uint32_t width, uint32_t 
     // not a second kernel that has to be kept in step.
     bool done = false;
     if (kvn_pending_ && kvn_src_[d])
-      done = kv_norm_commit_hip(a_dt_, kvn_src_[d], kvn_w_[d], kvn_eps_, D.a_raw[layer], pos,
+      done = kv_norm_commit_hip(a_dt_, kvn_src_[d], kvn_w_[d], kvn_eps_, D.a_raw_s[slot_][layer], pos,
                                 a_ring_, width, n_rot, kvn_rope_.freq_scale, kvn_rope_.theta_scale,
                                 kvn_rope_.ext_factor, kvn_rope_.lo, kvn_rope_.hi, kst);
     if (!done) {
@@ -1992,7 +2004,7 @@ bool DenseGpu::kv_commit(uint32_t layer, uint32_t pos, uint32_t width, uint32_t 
                            kvn_rope_.lo, kvn_rope_.hi, 1.0f);
         AFF_HIP_CHECK(hipGetLastError());
       }
-      kv_commit_batch_hip(a_dt_, D.d_u, 1, 0, 1, D.a_raw[layer], pos, a_ring_, width, n_rot,
+      kv_commit_batch_hip(a_dt_, D.d_u, 1, 0, 1, D.a_raw_s[slot_][layer], pos, a_ring_, width, n_rot,
                           D.stream);
     }
   }
@@ -2476,13 +2488,13 @@ bool DenseGpu::kv_commit_positions(uint64_t positions, std::string* err) {
   const uint64_t rb = kv_row_bytes(a_dt_, a_width_, a_rot_);
   for (Impl::Dev& D : impl_->dev) {
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    for (size_t l = 0; l < D.a_comp_span.size(); ++l) {
-      if (!D.a_comp_span[l].reserved()) continue;
-      const size_t was = D.a_comp_span[l].committed();
-      if (!D.a_comp_span[l].commit_to((uint64_t)comp_rows_for((uint32_t)l, positions) * rb,
+    for (size_t l = 0; l < D.a_comp_span_s[slot_].size(); ++l) {
+      if (!D.a_comp_span_s[slot_][l].reserved()) continue;
+      const size_t was = D.a_comp_span_s[slot_][l].committed();
+      if (!D.a_comp_span_s[slot_][l].commit_to((uint64_t)comp_rows_for((uint32_t)l, positions) * rb,
                                       D.a_kv_zero, err))
         return false;
-      st_.kv_bytes += D.a_comp_span[l].committed() - was;
+      st_.kv_bytes += D.a_comp_span_s[slot_][l].committed() - was;
     }
   }
   return true;
@@ -2531,7 +2543,7 @@ uint64_t DenseGpu::kv_committed_bytes() const {
   uint64_t t = 0;
   if (impl_)
     for (const Impl::Dev& D : impl_->dev)
-      for (const VirtualSpan& s : D.a_comp_span) t += s.committed();
+      for (const VirtualSpan& s : D.a_comp_span_s[slot_]) t += s.committed();
   return t;
 }
 
@@ -2603,30 +2615,30 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
                       std::to_string(d) + ", only " + std::to_string(freeb >> 20) + " free";
       return false;
     }
-    D.a_raw.assign(n_layer, nullptr);
-    D.a_comp.assign(n_layer, nullptr);
+    D.a_raw_s[slot_].assign(n_layer, nullptr);
+    D.a_comp_s[slot_].assign(n_layer, nullptr);
     D.a_sink.assign(n_layer, nullptr);
-    D.a_comp_span.clear();
-    D.a_comp_span.resize(n_layer);
+    D.a_comp_span_s[slot_].clear();
+    D.a_comp_span_s[slot_].resize(n_layer);
     // ONE zeroing stream a card, shared by every layer's span. Per-span streams cost 640 MiB of
     // host RAM across 86 of them, which comes out of the expert pool and strands experts on the
     // SSD tier — the pool is sized from what is left after everything else the process holds.
     if (!D.a_kv_zero)
       AFF_HIP_CHECK(hipStreamCreateWithFlags(&D.a_kv_zero, hipStreamNonBlocking));
     for (uint32_t l = 0; l < n_layer; ++l) {
-      AFF_HIP_CHECK(hipMalloc(&D.a_raw[l], raw_b));
-      AFF_HIP_CHECK(hipMemset(D.a_raw[l], 0, raw_b));
+      AFF_HIP_CHECK(hipMalloc(&D.a_raw_s[slot_][l], raw_b));
+      AFF_HIP_CHECK(hipMemset(D.a_raw_s[slot_][l], 0, raw_b));
       const uint64_t cb = (uint64_t)a_comp_rows_[l] * rb;
       if (cb) {
         std::string verr;
-        if (!D.a_comp_span[l].reserve(D.id, cb, &verr) ||
-            !D.a_comp_span[l].commit_to((uint64_t)comp_rows_for(l, a_init_pos_) * rb,
+        if (!D.a_comp_span_s[slot_][l].reserve(D.id, cb, &verr) ||
+            !D.a_comp_span_s[slot_][l].commit_to((uint64_t)comp_rows_for(l, a_init_pos_) * rb,
                                         D.a_kv_zero, &verr)) {
           if (err) *err = "KV layer " + std::to_string(l) + " on card " + std::to_string(d) +
                           ": " + verr;
           return false;
         }
-        D.a_comp[l] = static_cast<uint8_t*>(D.a_comp_span[l].ptr());
+        D.a_comp_s[slot_][l] = static_cast<uint8_t*>(D.a_comp_span_s[slot_][l].ptr());
       }
     }
     AFF_HIP_CHECK(hipMalloc(&D.a_q, (uint64_t)a_hpr_ * width * sizeof(float)));
@@ -2680,7 +2692,7 @@ bool DenseGpu::kv_part_bufs(KvPart part, uint32_t layer, size_t rank, uint64_t* 
                             uint64_t* rows_each, void* bufs[2], uint32_t* n_buf) const {
   if (!impl_ || !attn_ok_ || rank >= impl_->dev.size()) return false;
   Impl::Dev& D = impl_->dev[rank];
-  if (layer >= D.a_raw.size()) return false;
+  if (layer >= D.a_raw_s[slot_].size()) return false;
   const uint64_t rb = kv_row_bytes(a_dt_, a_width_, a_rot_);
   // reserve_runtime only grows the compressor where the layer compresses, so c_ratio is both the
   // ratio and the "is there one at all" flag — a ratio-0 layer and a draft stage both read 0.
@@ -2689,22 +2701,22 @@ bool DenseGpu::kv_part_bufs(KvPart part, uint32_t layer, size_t rank, uint64_t* 
   *n_buf = 1;
   switch (part) {
     case KvPart::Raw:
-      bufs[0] = D.a_raw[layer];  *row_bytes = rb;  *rows_each = a_ring_;
+      bufs[0] = D.a_raw_s[slot_][layer];  *row_bytes = rb;  *rows_each = a_ring_;
       break;
     case KvPart::Comp:
-      bufs[0] = D.a_comp[layer]; *row_bytes = rb;  *rows_each = a_comp_rows_[layer];
+      bufs[0] = D.a_comp_s[slot_][layer]; *row_bytes = rb;  *rows_each = a_comp_rows_[layer];
       break;
     case KvPart::Idx8:
-      if (layer >= D.a_idx8.size()) return false;
-      bufs[0] = D.a_idx8[layer]; *row_bytes = kIdxDim; *rows_each = a_maxcomp_;
+      if (layer >= D.a_idx8_s[slot_].size()) return false;
+      bufs[0] = D.a_idx8_s[slot_][layer]; *row_bytes = kIdxDim; *rows_each = a_maxcomp_;
       break;
     case KvPart::IdxScale:
-      if (layer >= D.a_idxs.size()) return false;
-      bufs[0] = D.a_idxs[layer]; *row_bytes = sizeof(float); *rows_each = a_maxcomp_;
+      if (layer >= D.a_idxs_s[slot_].size()) return false;
+      bufs[0] = D.a_idxs_s[slot_][layer]; *row_bytes = sizeof(float); *rows_each = a_maxcomp_;
       break;
     case KvPart::Hist:
       if (!ratio) return false;
-      bufs[0] = D.c_hkv[layer];  bufs[1] = D.c_hsc[layer];
+      bufs[0] = D.c_hkv_s[slot_][layer];  bufs[1] = D.c_hsc_s[slot_][layer];
       *row_bytes = (uint64_t)comp_width(ratio, a_width_) * sizeof(float);
       *rows_each = comp_hist(ratio);
       *n_buf = 2;
@@ -2713,7 +2725,7 @@ bool DenseGpu::kv_part_bufs(KvPart part, uint32_t layer, size_t rank, uint64_t* 
       // The index compressor exists on the ratio-4 layers alone, which is the rule compress_grow
       // applies when it decides whether to allocate one.
       if (ratio != 4u) return false;
-      bufs[0] = D.ci_hkv[layer]; bufs[1] = D.ci_hsc[layer];
+      bufs[0] = D.ci_hkv_s[slot_][layer]; bufs[1] = D.ci_hsc_s[slot_][layer];
       *row_bytes = (uint64_t)comp_width(ratio, kIdxDim) * sizeof(float);
       *rows_each = comp_hist(ratio);
       *n_buf = 2;
@@ -2821,7 +2833,7 @@ bool DenseGpu::kv_part_hash(KvPart part, uint32_t layer, uint64_t row0, uint64_t
 bool DenseGpu::attn_run(uint32_t layer, const float* q, const uint8_t* allowed, uint32_t pos,
                         uint32_t n_comp, float scale, float* heads_out) {
   AFF_TRACE(5);
-  if (!attn_ok_ || layer >= impl_->dev[0].a_raw.size() || !a_ring_) return false;
+  if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size() || !a_ring_) return false;
   // This layer's own allocation; the caller falls back rather than truncating.
   if (n_comp > a_comp_rows_[layer]) return false;
   // The window is a function of the position and nothing else — the same rule the batched kernel
@@ -2877,14 +2889,14 @@ bool DenseGpu::attn_run(uint32_t layer, const float* q, const uint8_t* allowed, 
       // plus at most index_topk admitted rows rather than every compressed row in the cache. At
       // 123K context that is 640 key rows against 30848.
       const bool gather = dev_mask && a_idx_gather_;
-      mqa_attend_flash_hip(D.a_q, D.a_raw[layer], D.a_comp[layer], gather ? nullptr : mask,
+      mqa_attend_flash_hip(D.a_q, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][layer], gather ? nullptr : mask,
                            gather ? D.a_admn : nullptr, gather ? 0u : n_comp,
                            D.a_sink[layer],
                            D.a_out, 0, 1, 1, pos, a_sliding_, a_ring_, a_maxcomp_, a_hpr_, scale,
                            D.stream, /*q_bf16=*/false, &D.fsplit, gather ? a_idx_topk_ : 0u,
                            gather ? D.a_adm : nullptr, kAdmCap);
     } else {
-      mqa_attend_hip(a_dt_, D.a_q, D.a_raw[layer], D.a_comp[layer], mask, D.a_sink[layer], D.a_out,
+      mqa_attend_hip(a_dt_, D.a_q, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][layer], mask, D.a_sink[layer], D.a_out,
                      a_hpr_, raw0, n_raw, a_ring_, n_comp, a_width_, a_rot_, scale, D.stream);
     }
     // heads_out is null when the caller will run attn_out() next and the heads should stay put.
@@ -3758,7 +3770,7 @@ bool DenseGpu::batch_mv_host(int src, const int32_t* h, const uint64_t* rows, ui
 
 bool DenseGpu::batch_kv_commit(uint32_t layer, uint32_t b0, uint32_t n, uint32_t pos0,
                                uint32_t width, uint32_t n_rot) {
-  if (!attn_ok_ || layer >= impl_->dev[0].a_raw.size() || !a_ring_ || !n) return false;
+  if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size() || !a_ring_ || !n) return false;
   AFF_TRACE(24);
   if (width != a_width_ || n_rot != a_rot_) return false;
   if (n > a_ring_) return false;                      // a sub-batch may not lap its own ring
@@ -3767,7 +3779,7 @@ bool DenseGpu::batch_kv_commit(uint32_t layer, uint32_t b0, uint32_t n, uint32_t
     AFF_HIP_CHECK(hipSetDevice(D.id));
     // One launch, straight from the chunk's dim-major latent. The per-token version staged a 2 KiB
     // column through d_u and then ran two more kernels on it, three launches a token a layer.
-    kv_commit_batch_hip(a_dt_, D.b_kv, b_nb_, b0, n, D.a_raw[layer], pos0, a_ring_, width, n_rot,
+    kv_commit_batch_hip(a_dt_, D.b_kv, b_nb_, b0, n, D.a_raw_s[slot_][layer], pos0, a_ring_, width, n_rot,
                         D.stream);
   }
   return true;
@@ -3837,30 +3849,30 @@ bool DenseGpu::batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t
 bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_t width,
                              uint32_t idx_width) {
   Impl::Dev& D = *(Impl::Dev*)devp;
-  const uint32_t nl = (uint32_t)D.a_comp.size();
+  const uint32_t nl = (uint32_t)D.a_comp_s[slot_].size();
   if (layer >= nl) return false;
-  if (D.c_hkv.empty()) {
-    D.c_hkv.assign(nl, nullptr);  D.c_hsc.assign(nl, nullptr);
-    D.ci_hkv.assign(nl, nullptr); D.ci_hsc.assign(nl, nullptr);
+  if (D.c_hkv_s[slot_].empty()) {
+    D.c_hkv_s[slot_].assign(nl, nullptr);  D.c_hsc_s[slot_].assign(nl, nullptr);
+    D.ci_hkv_s[slot_].assign(nl, nullptr); D.ci_hsc_s[slot_].assign(nl, nullptr);
     D.c_ape.assign(nl, nullptr);  D.c_norm.assign(nl, nullptr);
     D.ci_ape.assign(nl, nullptr); D.ci_norm.assign(nl, nullptr);
-    D.a_idx8.assign(nl, nullptr); D.a_idxs.assign(nl, nullptr);
+    D.a_idx8_s[slot_].assign(nl, nullptr); D.a_idxs_s[slot_].assign(nl, nullptr);
     D.c_ratio.assign(nl, 0u);
   }
-  if (D.c_hkv[layer]) return true;
+  if (D.c_hkv_s[slot_][layer]) return true;
   const uint32_t hist = comp_hist(ratio);
   const size_t hb = (size_t)hist * width * sizeof(float);
-  if (hipMalloc(&D.c_hkv[layer], hb) != hipSuccess) return false;
-  if (hipMalloc(&D.c_hsc[layer], hb) != hipSuccess) return false;
-  compressor_hist_reset_hip(D.c_hkv[layer], D.c_hsc[layer], width, hist, D.stream);
+  if (hipMalloc(&D.c_hkv_s[slot_][layer], hb) != hipSuccess) return false;
+  if (hipMalloc(&D.c_hsc_s[slot_][layer], hb) != hipSuccess) return false;
+  compressor_hist_reset_hip(D.c_hkv_s[slot_][layer], D.c_hsc_s[slot_][layer], width, hist, D.stream);
   // The indexer half exists only on the ratio-4 layers; idx_width 0 says so.
   if (idx_width) {
     const size_t ihb = (size_t)hist * idx_width * sizeof(float);
-    if (hipMalloc(&D.ci_hkv[layer], ihb) != hipSuccess) return false;
-    if (hipMalloc(&D.ci_hsc[layer], ihb) != hipSuccess) return false;
-    if (hipMalloc(&D.a_idx8[layer], (size_t)a_maxcomp_ * kIdxDim) != hipSuccess) return false;
-    if (hipMalloc(&D.a_idxs[layer], (size_t)a_maxcomp_ * sizeof(float)) != hipSuccess) return false;
-    compressor_hist_reset_hip(D.ci_hkv[layer], D.ci_hsc[layer], idx_width, hist, D.stream);
+    if (hipMalloc(&D.ci_hkv_s[slot_][layer], ihb) != hipSuccess) return false;
+    if (hipMalloc(&D.ci_hsc_s[slot_][layer], ihb) != hipSuccess) return false;
+    if (hipMalloc(&D.a_idx8_s[slot_][layer], (size_t)a_maxcomp_ * kIdxDim) != hipSuccess) return false;
+    if (hipMalloc(&D.a_idxs_s[slot_][layer], (size_t)a_maxcomp_ * sizeof(float)) != hipSuccess) return false;
+    compressor_hist_reset_hip(D.ci_hkv_s[slot_][layer], D.ci_hsc_s[slot_][layer], idx_width, hist, D.stream);
   }
   D.c_ratio[layer] = ratio;
   return true;
@@ -3871,7 +3883,7 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
   if (a.h_kv < 0 || a.h_sc < 0) return false;
   const bool has_idx = a.h_ikv >= 0 && a.h_isc >= 0;      // ratio 4 only
   if (has_idx && a.idx_dim != kIdxDim) return false;
-  if (a.layer >= impl_->dev[0].a_comp.size()) return false;
+  if (a.layer >= impl_->dev[0].a_comp_s[slot_].size()) return false;
   // This layer's own allocation for the KV half; the indexer half exists only on ratio-4 layers and
   // those are the widest, so a_maxcomp_ is exactly right for it.
   if (a.slot0 + a.n_out > a_comp_rows_[a.layer]) return false;
@@ -3984,9 +3996,9 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
     if (a.n_out) {
       CompressJob c{};
       c.kv = D.c_kv; c.sc = D.c_sc;
-      c.hist_kv = D.c_hkv[a.layer]; c.hist_sc = D.c_hsc[a.layer];
+      c.hist_kv = D.c_hkv_s[slot_][a.layer]; c.hist_sc = D.c_hsc_s[slot_][a.layer];
       c.ape = D.c_ape[a.layer]; c.norm = D.c_norm[a.layer];
-      c.out = D.a_comp[a.layer];
+      c.out = D.a_comp_s[slot_][a.layer];
       c.out_stride = kv_row_bytes(a_dt_, a_width_, a_rot_);
       c.slot0 = a.slot0; c.head_dim = a.width;
       compressor_rows_hip(0, c, a.n, a.pos0, a.ratio, a.n_out, a.n_rot, a.rope, a.eps, st);
@@ -3994,9 +4006,9 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
       if (has_idx) {
         CompressJob i{};
         i.kv = D.ci_kv; i.sc = D.ci_sc;
-        i.hist_kv = D.ci_hkv[a.layer]; i.hist_sc = D.ci_hsc[a.layer];
+        i.hist_kv = D.ci_hkv_s[slot_][a.layer]; i.hist_sc = D.ci_hsc_s[slot_][a.layer];
         i.ape = D.ci_ape[a.layer]; i.norm = D.ci_norm[a.layer];
-        i.out = D.a_idx8[a.layer]; i.out_scale = D.a_idxs[a.layer];
+        i.out = D.a_idx8_s[slot_][a.layer]; i.out_scale = D.a_idxs_s[slot_][a.layer];
         i.out_stride = a.idx_dim;
         i.slot0 = a.idx_slot0; i.head_dim = a.idx_dim;
         compressor_rows_hip(1, i, a.n, a.pos0, a.ratio, a.n_out, a.n_rot, a.rope, a.eps, st);
@@ -4005,10 +4017,10 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
     // AFTER the compressors, on the same stream: the window they read is the window this
     // overwrites, and stream order is the whole reason that is safe.
     const uint32_t hist = comp_hist(a.ratio);
-    compressor_hist2_hip(D.c_kv, D.c_sc, D.c_hkv[a.layer], D.c_hsc[a.layer], cw,
+    compressor_hist2_hip(D.c_kv, D.c_sc, D.c_hkv_s[slot_][a.layer], D.c_hsc_s[slot_][a.layer], cw,
                          has_idx ? D.ci_kv : nullptr, D.ci_sc,
-                         has_idx ? D.ci_hkv[a.layer] : nullptr,
-                         has_idx ? D.ci_hsc[a.layer] : nullptr, iw, a.n, a.pos0, hist, st);
+                         has_idx ? D.ci_hkv_s[slot_][a.layer] : nullptr,
+                         has_idx ? D.ci_hsc_s[slot_][a.layer] : nullptr, iw, a.n, a.pos0, hist, st);
   }
   ++st_.calls;
   return true;
@@ -4026,7 +4038,7 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
   if (a.h_kv < 0 || a.h_sc < 0) return false;
   const bool has_idx = a.h_ikv >= 0 && a.h_isc >= 0;
   if (has_idx && a.idx_dim != kIdxDim) return false;
-  if (a.layer >= impl_->dev[0].a_comp.size()) return false;
+  if (a.layer >= impl_->dev[0].a_comp_s[slot_].size()) return false;
   if (a.slot0 + a.n_out > a_comp_rows_[a.layer]) return false;
   if (has_idx && a.idx_slot0 + a.n_out > a_maxcomp_) return false;
   AFF_TRACE(32);
@@ -4079,7 +4091,7 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
     // weights and the indexer scores every token, so it cannot be deferred. It is also much the
     // smallest of the five.
     if (D.c_pend.empty()) {
-      const size_t nl = D.a_comp.size();
+      const size_t nl = D.a_comp_s[slot_].size();
       D.c_pend.assign(nl, nullptr); D.c_np.assign(nl, 0u);
       D.c_ppos0.assign(nl, 0u);     D.c_pcap.assign(nl, 0u);
     }
@@ -4202,9 +4214,9 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
       if (a.n_out) {
         CompressJob c{};
         c.kv = D.c_kv; c.sc = D.c_sc;
-        c.hist_kv = D.c_hkv[a.layer]; c.hist_sc = D.c_hsc[a.layer];
+        c.hist_kv = D.c_hkv_s[slot_][a.layer]; c.hist_sc = D.c_hsc_s[slot_][a.layer];
         c.ape = D.c_ape[a.layer]; c.norm = D.c_norm[a.layer];
-        c.out = D.a_comp[a.layer];
+        c.out = D.a_comp_s[slot_][a.layer];
         c.out_stride = kv_row_bytes(a_dt_, a_width_, a_rot_);
         c.slot0 = a.slot0; c.head_dim = a.width;
         compressor_rows_hip(0, c, nb, pos0, a.ratio, a.n_out, a.n_rot, a.rope, a.eps, st);
@@ -4212,9 +4224,9 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
         if (has_idx) {
           CompressJob i{};
           i.kv = D.ci_kv; i.sc = D.ci_sc;
-          i.hist_kv = D.ci_hkv[a.layer]; i.hist_sc = D.ci_hsc[a.layer];
+          i.hist_kv = D.ci_hkv_s[slot_][a.layer]; i.hist_sc = D.ci_hsc_s[slot_][a.layer];
           i.ape = D.ci_ape[a.layer]; i.norm = D.ci_norm[a.layer];
-          i.out = D.a_idx8[a.layer]; i.out_scale = D.a_idxs[a.layer];
+          i.out = D.a_idx8_s[slot_][a.layer]; i.out_scale = D.a_idxs_s[slot_][a.layer];
           i.out_stride = a.idx_dim;
           i.slot0 = a.idx_slot0; i.head_dim = a.idx_dim;
           compressor_rows_hip(1, i, nb, pos0, a.ratio, a.n_out, a.n_rot, a.rope, a.eps, st);
@@ -4222,10 +4234,10 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
       }
       // AFTER the pool, on the same stream: the window it reads is the window this overwrites.
       const uint32_t hist = comp_hist(a.ratio);
-      compressor_hist2_hip(D.c_kv, D.c_sc, D.c_hkv[a.layer], D.c_hsc[a.layer], cw,
+      compressor_hist2_hip(D.c_kv, D.c_sc, D.c_hkv_s[slot_][a.layer], D.c_hsc_s[slot_][a.layer], cw,
                            has_idx ? D.ci_kv : nullptr, D.ci_sc,
-                           has_idx ? D.ci_hkv[a.layer] : nullptr,
-                           has_idx ? D.ci_hsc[a.layer] : nullptr, iw, nb, pos0, hist, st);
+                           has_idx ? D.ci_hkv_s[slot_][a.layer] : nullptr,
+                           has_idx ? D.ci_hsc_s[slot_][a.layer] : nullptr, iw, nb, pos0, hist, st);
       D.c_np[a.layer] = 0;
     }
   }
@@ -4247,14 +4259,14 @@ bool DenseGpu::indexer_one(uint32_t layer, int32_t h, uint64_t qr, uint32_t n_he
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     hipStream_t st = D.stream;
-    if (!D.d_qrn || layer >= D.a_idx8.size() || !D.a_idx8[layer] || !D.i_w) return false;
+    if (!D.d_qrn || layer >= D.a_idx8_s[slot_].size() || !D.a_idx8_s[slot_][layer] || !D.i_w) return false;
     if (!idx_grow(&D, 1, n_head, dim)) return false;
     launch_mv({e.sh[d].data, e.sh[d].scales, e.quant, e.sh[d].ps}, D.d_qrn, (uint32_t)(n_head * dim),
               (uint32_t)qr, D.i_q, st);
     idx_rope_qat_hip(D.i_q, 1, n_head, n_rot, pos, rope.freq_scale, rope.theta_scale,
                      rope.ext_factor, rope.lo, rope.hi, st);
     idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head * dim, st);
-    indexer_scores_hip(D.i_q8, D.i_qs, D.a_idx8[layer], D.a_idxs[layer], D.i_w, D.i_sc, 1, n_keys,
+    indexer_scores_hip(D.i_q8, D.i_qs, D.a_idx8_s[slot_][layer], D.a_idxs_s[slot_][layer], D.i_w, D.i_sc, 1, n_keys,
                        n_head, st);
     // Null counts: at one token the score row IS its own prefix. The clear is over `n_mask`, the
     // attention's own row count for this token, and NOT over the plane's pitch: the pitch comes
@@ -4275,14 +4287,14 @@ bool DenseGpu::compress_reset() {
   if (!impl_) return false;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
-    if (D.c_hkv.empty()) continue;
+    if (D.c_hkv_s[slot_].empty()) continue;
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    for (size_t l = 0; l < D.c_hkv.size(); ++l) {
-      if (!D.c_hkv[l]) continue;
+    for (size_t l = 0; l < D.c_hkv_s[slot_].size(); ++l) {
+      if (!D.c_hkv_s[slot_][l]) continue;
       const uint32_t r = D.c_ratio[l], hist = comp_hist(r);
-      compressor_hist_reset_hip(D.c_hkv[l], D.c_hsc[l], comp_width(r, a_width_), hist, D.stream);
-      if (D.ci_hkv[l])
-        compressor_hist_reset_hip(D.ci_hkv[l], D.ci_hsc[l], comp_width(r, kIdxDim), hist, D.stream);
+      compressor_hist_reset_hip(D.c_hkv_s[slot_][l], D.c_hsc_s[slot_][l], comp_width(r, a_width_), hist, D.stream);
+      if (D.ci_hkv_s[slot_][l])
+        compressor_hist_reset_hip(D.ci_hkv_s[slot_][l], D.ci_hsc_s[slot_][l], comp_width(r, kIdxDim), hist, D.stream);
     }
   }
   return true;
@@ -4309,7 +4321,7 @@ bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp,
     // rows with one f32 scale each when it emitted them. They used to arrive as host f32 — a
     // n_keys x 128 upload and a quantise pass, per layer per chunk, of rows that had not changed
     // since the chunk that produced them.
-    if (layer >= D.a_idx8.size() || !D.a_idx8[layer]) return false;
+    if (layer >= D.a_idx8_s[slot_].size() || !D.a_idx8_s[slot_][layer]) return false;
     std::memcpy(D.hi_nc, n_comp, (size_t)n * sizeof(uint32_t));
     AFF_HIP_CHECK(hipMemcpyAsync(D.i_nc, D.hi_nc, (size_t)n * sizeof(uint32_t),
                                  hipMemcpyHostToDevice, st));
@@ -4329,8 +4341,8 @@ bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp,
     // Each token's row is independent, so tiling cannot move a score or a tie.
     for (uint32_t t0 = 0; t0 < n; t0 += i_tile_) {
       const uint32_t nt = std::min(i_tile_, n - t0);
-      indexer_scores_hip(D.i_q8 + (size_t)t0 * n_head * dim, D.i_qs + t0, D.a_idx8[layer],
-                         D.a_idxs[layer], D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys,
+      indexer_scores_hip(D.i_q8 + (size_t)t0 * n_head * dim, D.i_qs + t0, D.a_idx8_s[slot_][layer],
+                         D.a_idxs_s[slot_][layer], D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys,
                          n_head, st);
       // Straight into b_allow at the CHUNK's own token indexing; batch_attend then offsets by its
       // sub-batch. The mask never leaves the card.
@@ -4351,7 +4363,7 @@ bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp,
 bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t pos0,
                             const uint8_t* allowed, uint32_t mask_stride, const uint32_t* n_comp,
                             float scale) {
-  if (!attn_ok_ || layer >= impl_->dev[0].a_raw.size() || !b_nb_ || !n || !a_ring_) return false;
+  if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size() || !b_nb_ || !n || !a_ring_) return false;
   AFF_TRACE(25);
   if (b0 + n > b_nb_) return false;
   // The indexer writes b_allow for its OWN layer only. Keyed by layer rather than a bare flag: a
@@ -4393,7 +4405,7 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
     const bool flash = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
     const bool gather = dev_mask && a_idx_gather_;
     if (flash)
-      mqa_attend_flash_hip(D.b_qtm, D.a_raw[layer], D.a_comp[layer],
+      mqa_attend_flash_hip(D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][layer],
                            gather ? nullptr
                                   : (dev_mask ? D.b_allow + (size_t)b0 * a_maxcomp_
                                               : ((allowed && n_comp_max) ? D.b_allow : nullptr)),
@@ -4403,7 +4415,7 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
                            /*q_bf16=*/true, &D.fsplit, gather ? a_idx_topk_ : n_comp_max,
                            gather ? D.b_adm + (size_t)b0 * kAdmCap : nullptr, kAdmCap);
     else
-      mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw[layer], D.a_comp[layer],
+      mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][layer],
                            dev_mask ? D.b_allow + (size_t)b0 * a_maxcomp_
                                     : ((allowed && n_comp_max) ? D.b_allow : nullptr),
                            D.b_ncomp, D.a_sink[layer], D.b_htm, b0, n, b_nb_, pos0, a_sliding_,
@@ -5289,7 +5301,7 @@ bool DenseGpu::draft_kv(uint32_t layer, int32_t kv, int32_t kvnorm, uint32_t n, 
                         uint64_t hidden, uint32_t width, uint32_t n_rot, RopeDerived rope,
                         float eps) {
   if (!n || n > kNarrowTok || kv < 0 || (size_t)kv >= ent_.size() || kvnorm < 0) return false;
-  if (!attn_ok_ || layer >= impl_->dev[0].a_raw.size()) return false;
+  if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size()) return false;
   b_nb_ = kNarrowTok; b_live_ = n;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
@@ -5311,7 +5323,7 @@ bool DenseGpu::draft_kv(uint32_t layer, int32_t kv, int32_t kvnorm, uint32_t n, 
 // so the window is computed once, on the host, out of positions rather than out of each query's.
 bool DenseGpu::draft_attend(uint32_t layer, uint32_t n, uint32_t pos0, uint32_t win_lo,
                             float scale) {
-  if (!attn_ok_ || layer >= impl_->dev[0].a_raw.size() || !b_nb_ || !n) return false;
+  if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size() || !b_nb_ || !n) return false;
   const uint32_t hi = pos0 + n - 1;
   if (win_lo > hi) return false;
   const uint32_t win = hi - win_lo + 1u;
@@ -5321,7 +5333,7 @@ bool DenseGpu::draft_attend(uint32_t layer, uint32_t n, uint32_t pos0, uint32_t 
     AFF_HIP_CHECK(hipSetDevice(D.id));
     // Deliberately the VALU kernel and not the flash one: five queries over ~133 keys is a hundredth
     // of what the flash path's tiling is for, and this way the draft cannot perturb it.
-    mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw[layer], nullptr, nullptr, nullptr,
+    mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw_s[slot_][layer], nullptr, nullptr, nullptr,
                          D.a_sink[layer], D.b_htm, 0, n, b_nb_, pos0, a_sliding_, a_ring_, 0,
                          a_maxcomp_, a_hpr_, a_width_, a_rot_, scale, D.stream,
                          /*q_bf16=*/true, win, win_lo % a_ring_);
