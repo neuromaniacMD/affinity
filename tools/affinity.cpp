@@ -1760,6 +1760,11 @@ int main(int argc, char** argv) {
         nd = B;
       }
       const uint32_t P = st.pos;
+      if (slot_dbg && nd) {
+        std::string ds;
+        for (uint32_t i = 0; i < nd; ++i) ds += std::to_string(draft[i]) + (i + 1 < nd ? "," : "");
+        aff::ui::err("slot %u DRAFT P=%u next=%u -> [%s]\n", slot, P, next, ds.c_str());
+      }
       fed[0] = next;
       for (uint32_t i = 0; i < nd; ++i) fed[1 + i] = draft[i];
       // The proposals the target is asked to price, and the uniforms its draws use. Position j is
@@ -1806,6 +1811,12 @@ int main(int argc, char** argv) {
         while (k < nd && accept_u[k] < (double)vb.draws[k].p_query) ++k;
         if (k < nd) { rejected = true; reject_tok = vb.draws[k].tok_excl; }
         for (uint32_t j = 0; j < nd; ++j) match[j] = accept_u[j] < (double)vb.draws[j].p_query;
+      }
+      if (slot_dbg && nd) {
+        std::string gs;
+        for (uint32_t i = 0; i < nd; ++i)
+          gs += std::to_string(!sc ? vb.greedy[i] : vb.draws[i].tok) + (i + 1 < nd ? "," : "");
+        aff::ui::err("slot %u VERIFY P=%u k=%u target=[%s]\n", slot, P, k, gs.c_str());
       }
       model.note_block(nd, k, match.data());
       // Positions P..P+k are real; P+k+1 holds vb.greedy[k] and is fed by the next block.
