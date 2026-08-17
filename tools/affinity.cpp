@@ -901,6 +901,16 @@ int main(int argc, char** argv) {
                    (unsigned long long)kMaxKvPositions,
                    (unsigned long long)kMaxKvPositions * kSlots);
     }
+    // The prefix cache holds single-sequence design (a shared writer thread, stage pool and index)
+    // and poisons draft acceptance for one slot under two interleaved sequences — a concurrency bug
+    // isolated but not yet fixed (repro: SLOTS-STAGE3 findings). Correct behaviour beats a fast
+    // wrong one, so multi-slot serving runs WITHOUT it. Single-slot is unaffected and keeps it.
+    if (kSlots > 1 && !pcache.dir.empty()) {
+      aff::ui::err("prefix cache: disabled under --slots %u (single-sequence design; multi-slot "
+                   "poisons draft acceptance — see SLOTS-STAGE3). Single-slot keeps it.\n", kSlots);
+      pcache.dir.clear();
+      pcache_verify = false;
+    }
     if (dense_gpu.attn_init(c.n_layer + n_stage, c.n_head, c.head_dim, c.rope_dim, c.sliding,
                             comp_rows.data(), KvDtype::FP8R, kMaxKvPositions, kKvCommitPositions,
                             &kerr))
@@ -2305,12 +2315,15 @@ int main(int argc, char** argv) {
     uint32_t matched_blocks = 0;              // read again below, by the promotion boundary
     if (prefix_cache.ready() && n_pre) {
       uint32_t& matched = matched_blocks;
-      const uint32_t hit = prefix_cache.lookup(ids.data(), n_pre, &matched);   // index only, no I/O
       std::string rerr;
+      uint32_t hit = 0;
       {
-        // restore() writes attention state into THIS slot's KV, so it is a step like any other.
+        // lookup reads the cache index and restore writes this slot's KV; both must be serialized
+        // against the other slot's publish, which mutates the same index and stage pool. lookup
+        // was previously outside the lock, racing publish's hash-table writes.
         std::unique_lock<std::mutex> step(engine_mu);
         dense_gpu.set_slot(slot);
+        hit = prefix_cache.lookup(ids.data(), n_pre, &matched);   // index only, no I/O
         if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
           model.restore_state(&st, hit);
           from = hit;
