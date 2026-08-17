@@ -5338,6 +5338,11 @@ uint64_t DenseGpu::kv_hash_debug(uint32_t layer) {
   return v;
 }
 
+void DenseGpu::sync_devices() {
+  if (!impl_) return;
+  for (auto& D : impl_->dev) { AFF_HIP_CHECK(hipSetDevice(D.id)); AFF_HIP_CHECK(hipDeviceSynchronize()); }
+}
+
 uint64_t DenseGpu::tap_hash_debug() {
   if (!impl_ || impl_->dev.empty()) return 0;
   Impl::Dev& D = impl_->dev[0];

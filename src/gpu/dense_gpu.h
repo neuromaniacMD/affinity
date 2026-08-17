@@ -456,6 +456,11 @@ private:
 
  public:
   uint32_t n_slots() const { return n_slots_; }
+  // Full device sync on every card. At a slot boundary this guarantees NONE of this sequence's
+  // async work (on any stream: compute, KV-zero, the staging rings) is still in flight when the
+  // next slot reuses the shared scratch. The block already syncs the compute stream for the head
+  // readback; this covers the other streams. See slots(3/3g).
+  void sync_devices();
   // DEBUG ONLY (AFF_SLOT_DEBUG): FNV-1a over the head of the CURRENT slot's DSpark tap plane.
   // The draft reads the first few rows of it at the start of every block, so hashing the head is
   // enough to answer "did a foreign block change my plane". Copies D2H and syncs; never on a
