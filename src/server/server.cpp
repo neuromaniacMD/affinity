@@ -305,6 +305,22 @@ static std::string dechunk(const std::string& in) {
   return out;
 }
 
+// Blocks until a slot frees. FIFO is not promised: any free slot will do, and a waiter that loses
+// a wakeup race simply waits again — the predicate is re-checked, so no request is lost.
+uint32_t Server::acquire_slot() {
+  std::unique_lock<std::mutex> lk(slot_mu_);
+  slot_cv_.wait(lk, [&] { return slot_busy_ != (n_slots_ >= 64 ? ~0ull : ((1ull << n_slots_) - 1)); });
+  for (uint32_t i = 0; i < n_slots_; ++i)
+    if (!(slot_busy_ & (1ull << i))) { slot_busy_ |= (1ull << i); return i; }
+  return 0;                                  // unreachable: the predicate guarantees a free bit
+}
+
+void Server::release_slot(uint32_t s) {
+  { std::lock_guard<std::mutex> lk(slot_mu_); slot_busy_ &= ~(1ull << s); }
+  slot_cv_.notify_one();
+}
+
+
 void Server::serve_one(int fd) {
   int one = 1;
   ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -410,7 +426,10 @@ void Server::serve_one(int fd) {
     bool alive = true;
     const std::string obj = is_chat ? "chat.completion.chunk" : "text_completion";
     GenResult res;
-    std::unique_lock<std::mutex> gen_lock(gen_mu_);
+    // Held for the whole request: the slot owns this sequence's KV until the turn is done. Step-
+    // level exclusion is the generator's business, not the server's.
+    const uint32_t slot = acquire_slot();
+    struct Rel { Server* s; uint32_t i; ~Rel() { s->release_slot(i); } } rel{this, slot};
     // The first chat delta of a stream carries the role and nothing else to say it opens an
     // assistant message; clients key the new message on it, and OpenAI itself sends it.
     bool opened = false;
@@ -433,8 +452,7 @@ void Server::serve_one(int fd) {
       j += "}]}\n\n";
       alive = send_all(fd, j.data(), j.size());
       return alive;
-    }, &res);
-    gen_lock.unlock();
+    }, &res, slot);
     // The 200 and its headers are long gone by the time generation reports a problem, so a stream
     // carries the refusal as an `error` event — which is how OpenAI reports a mid-stream failure.
     if (alive && !res.error.empty()) {
@@ -482,8 +500,9 @@ void Server::serve_one(int fd) {
 
   GenResult res;
   {
-    std::lock_guard<std::mutex> gen_lock(gen_mu_);
-    gen_(r, [](const std::string&, Delta, bool) -> bool { return true; }, &res);
+    const uint32_t slot = acquire_slot();
+    struct Rel { Server* s; uint32_t i; ~Rel() { s->release_slot(i); } } rel{this, slot};
+    gen_(r, [](const std::string&, Delta, bool) -> bool { return true; }, &res, slot);
   }
   if (!res.error.empty()) {
     const std::string e = "{\"error\":{\"message\":\"" + json_escape(res.error) +

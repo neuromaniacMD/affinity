@@ -1,5 +1,7 @@
 // affinity — CLI entry point: serve an OpenAI-compatible endpoint from a .aff model.
 #include "build_stamp.h"
+#include <mutex>
+
 #include "engine/model.h"
 #include "engine/instrument.h"
 #include "engine/route_trace.h"
@@ -1678,8 +1680,16 @@ int main(int argc, char** argv) {
   // greedy decode by construction, so this is exactly temperature 0 — the caller is told rather
   // than quietly given something else.
   //
+  // ---- the engine step lock ---------------------------------------------------------------------
+  //
+  // Sequence state is per SLOT since --slots, but the per-step scratch is not: one set of staging
+  // buffers, one prefill arena, one indexer score plane. So requests may be in flight together and
+  // their STEPS may not overlap. This is held across one step — a prefill chunk, or one speculative
+  // block — and released around anything that waits on the network, so a slow reader cannot stall
+  // the cards.
+  std::mutex engine_mu;
   // `emit` takes each accepted token and returns false to stop. Returns how many were emitted.
-  auto spec_decode = [&](SeqState& st, const Model::BlockOut& seed_blk, uint32_t first,
+  auto spec_decode = [&](uint32_t slot, SeqState& st, const Model::BlockOut& seed_blk, uint32_t first,
                          std::vector<uint32_t>& hist, uint32_t max_new, bool ignore_eos_,
                          const std::function<bool(uint32_t)>& emit,
                          const SamplerConfig* sc = nullptr,
@@ -1709,6 +1719,14 @@ int main(int argc, char** argv) {
     uint32_t next = first, generated = 0;
     bool stop = false;
     while (generated < max_new && !stop) {
+      // ONE BLOCK is one step. Taken here and dropped right after `rollback`, which is the last
+      // thing in the iteration that touches the device: everything below it is host bookkeeping and
+      // the emit callback, and emit writes to a socket.
+      std::unique_lock<std::mutex> step(engine_mu);
+      if (!dense_gpu.set_slot(slot)) {
+        aff::ui::fatal("fatal: slot %u out of range\n", slot);
+        std::abort();
+      }
       if (draft_on && seed_n && !model.dspark_seed(seed_n, seed_pos0)) {
         aff::ui::fatal("fatal: dspark_seed refused %u positions at %u\n", seed_n, seed_pos0);
         std::abort();
@@ -1774,6 +1792,7 @@ int main(int argc, char** argv) {
       model.note_block(nd, k, match.data());
       // Positions P..P+k are real; P+k+1 holds vb.greedy[k] and is fed by the next block.
       model.rollback(&st, P + k + 1);
+      step.unlock();                    // the cards are free from here; the rest is host-side
       seed_n = vb.tap_rows ? k + 1 : 0u;
       seed_pos0 = P;
       // The token at position k: the target's own, from whichever rule applied above.
@@ -2033,7 +2052,7 @@ int main(int argc, char** argv) {
     }
     dash.stage(aff::ui::Stage::Decode);
     run_view = {ids.size() ? ids.size() - 1 : 0, (uint64_t)n_predict, hist.size(), pre_rate, t1};
-    generated += (int)spec_decode(st, blk, next, hist, (uint32_t)n_predict, ignore_eos,
+    generated += (int)spec_decode(/*slot=*/0u, st, blk, next, hist, (uint32_t)n_predict, ignore_eos,
                                     [&](uint32_t id) {
         aff::ui::tok(tok.vocab_size() ? tok.decode_one(id) : std::to_string(id) + " ");
         return true;
@@ -2126,8 +2145,9 @@ int main(int argc, char** argv) {
   // Defaults are the model card's: temperature 1.0, top_p 0.95 (its agentic recommendation, and this
   // server exists to be driven by agents), and a random seed per request so two identical requests
   // are two samples rather than one answer twice.
+  srv.set_slots(kSlots);
   const bool ok = srv.start(host, port, [&](const CompletionRequest& req, const TokenSink& sink,
-                                            GenResult* res) {
+                                            GenResult* res, uint32_t slot) {
     std::vector<ChatMsg> msgs;
     if (req.messages.empty()) {
       // The legacy completions endpoint: a raw prompt with no roles, so it is encoded as a bare
@@ -2254,11 +2274,16 @@ int main(int argc, char** argv) {
     uint32_t matched_blocks = 0;              // read again below, by the promotion boundary
     if (prefix_cache.ready() && n_pre) {
       uint32_t& matched = matched_blocks;
-      const uint32_t hit = prefix_cache.lookup(ids.data(), n_pre, &matched);
+      const uint32_t hit = prefix_cache.lookup(ids.data(), n_pre, &matched);   // index only, no I/O
       std::string rerr;
-      if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
-        model.restore_state(&st, hit);
-        from = hit;
+      {
+        // restore() writes attention state into THIS slot's KV, so it is a step like any other.
+        std::unique_lock<std::mutex> step(engine_mu);
+        dense_gpu.set_slot(slot);
+        if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
+          model.restore_state(&st, hit);
+          from = hit;
+        }
       }
       // One line a request. What a prefix cache does is invisible from the outside — a miss and a
       // hit differ only in how long the reply took — so the hit length is reported rather than left
@@ -2304,6 +2329,8 @@ int main(int argc, char** argv) {
       if (b > from && b + c.sliding <= n_pre) promote = (uint32_t)b;
     }
     if (promote) {
+      std::unique_lock<std::mutex> step(engine_mu);
+      dense_gpu.set_slot(slot);
       kv_reserve_for(st.pos + (uint64_t)ids.size() + 2);
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, promote - from, &st, nullptr,
@@ -2323,6 +2350,8 @@ int main(int argc, char** argv) {
       from = promote;
     }
     if (n_pre > from) {
+      std::unique_lock<std::mutex> step(engine_mu);
+      dense_gpu.set_slot(slot);
       kv_reserve_for(st.pos + (uint64_t)ids.size() + 2);
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
@@ -2460,7 +2489,7 @@ int main(int argc, char** argv) {
 
 
     run_view = {ids.size(), total_budget, hist.size(), 0.0, std::chrono::steady_clock::now()};
-    const uint32_t made = spec_decode(st, blk, ids.empty() ? 1u : ids.back(), hist, total_budget,
+    const uint32_t made = spec_decode(slot, st, blk, ids.empty() ? 1u : ids.back(), hist, total_budget,
                                       /*ignore_eos_=*/false, [&](uint32_t id) {
       if ((int32_t)id == tok.eos()) return false;
       raw += tok.vocab_size() ? tok.decode_one(id) : std::string();

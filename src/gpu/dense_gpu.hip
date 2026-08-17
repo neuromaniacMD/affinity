@@ -408,7 +408,11 @@ struct DenseGpu::Impl {
     // The DSpark tap plane itself, [rows][taps * n_embd] token-major — written by batch_hc_tap as
     // the target runs and read by draft_proj, both on this card. It is the whole of what used to be
     // Block::main_hidden, a host vector that crossed the bus twice.
-    float* b_tap = nullptr;  size_t tap_bytes = 0;
+    // PER SLOT: the target's verify writes this plane and the NEXT block's draft reads it, so it
+    // is per-sequence state, not scratch. Sharing it across slots leaves each sequence's draft
+    // conditioned on its neighbour's hidden states — correct output (the verify rejects the bad
+    // proposals) at a collapsed acceptance rate, i.e. a silent ~2.4x slowdown.
+    std::vector<float*> b_tap_s;  std::vector<size_t> tap_bytes_s;
     // ---- the W8A8 activation ------------------------------------------------------------------
     // One slot, and no memo: a cache keyed on the source pointer would be wrong, because b_norm is
     // rewritten by hc_pre every layer and keeps its address. quant_act() is called where the
@@ -538,13 +542,14 @@ DenseGpu::~DenseGpu() {
       D.a_q, D.a_out, D.d_rlog,
       D.b_mix, D.b_pre, D.b_post, D.b_comb, D.b_cur, D.b_norm, D.b_block,
       D.b_emb, D.b_q, D.b_hinv, D.b_kv, D.b_qr, D.b_g, D.b_u, D.b_y, D.b_tm,
-      D.b_head, D.b_amx, D.b_dxt, D.b_dx, D.b_dm, D.b_tap};
+      D.b_head, D.b_amx, D.b_dxt, D.b_dx, D.b_dm};
     // b_htm and b_heads are deliberately absent: they alias b_q and b_qtm.
     for (float* p : bufs) if (p) (void)hipFree(p);
     for (uint16_t* p : {D.b_hc, D.b_hc_next, D.b_qtm}) if (p) (void)hipFree(p);
     for (float* p : D.vec) if (p) (void)hipFree(p);
     for (uint16_t* p : D.router) if (p) (void)hipFree(p);
     for (float* p : D.rbias) if (p) (void)hipFree(p);
+    for (float* p : D.b_tap_s) if (p) (void)hipFree(p);
     for (auto& v : D.a_raw_s)  for (uint8_t* p : v) if (p) (void)hipFree(p);
     for (auto& v : D.a_comp_s) for (uint8_t* p : v) if (p) (void)hipFree(p);
     for (float* p : D.c_pend) if (p) (void)hipFree(p);
@@ -2619,6 +2624,7 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
     D.a_sink.assign(n_layer, nullptr);            // shared model state, not per-sequence
     // The slot dimension is sized HERE, not at device creation: --slots is parsed after the
     // devices exist, so init()'s sizing ran while n_slots_ was still 1.
+    D.b_tap_s.assign(n_slots_, nullptr); D.tap_bytes_s.assign(n_slots_, 0);
     D.a_raw_s.resize(n_slots_);   D.a_comp_s.resize(n_slots_);
     D.a_comp_span_s.resize(n_slots_);
     D.a_idx8_s.resize(n_slots_);  D.a_idxs_s.resize(n_slots_);
@@ -5021,17 +5027,17 @@ bool DenseGpu::batch_hc_tap(uint32_t slot, uint32_t n_taps, uint32_t b_lo, uint3
     AFF_HIP_CHECK(hipSetDevice(D.id));
     // Grown, never shrunk: `rows_cap` is `sliding` for the prompt's tail and B+1 for every block
     // after it, so one allocation on the first chunk serves the whole run.
-    if (D.tap_bytes < want) {
-      if (D.b_tap) (void)hipFree(D.b_tap);
-      D.b_tap = nullptr; D.tap_bytes = 0;
-      if (hipMalloc(&D.b_tap, want) != hipSuccess) return false;
+    if (D.tap_bytes_s[slot_] < want) {
+      if (D.b_tap_s[slot_]) (void)hipFree(D.b_tap_s[slot_]);
+      D.b_tap_s[slot_] = nullptr; D.tap_bytes_s[slot_] = 0;
+      if (hipMalloc(&D.b_tap_s[slot_], want) != hipSuccess) return false;
       // Zeroed once so a row the taps never reach — a chunk shorter than the window — carries
       // zeros rather than whatever the allocator returned. The host plane it replaces was
       // value-initialised for the same reason.
-      AFF_HIP_CHECK(hipMemsetAsync(D.b_tap, 0, want, D.stream));
-      D.tap_bytes = want;
+      AFF_HIP_CHECK(hipMemsetAsync(D.b_tap_s[slot_], 0, want, D.stream));
+      D.tap_bytes_s[slot_] = want;
     }
-    batch_hc_tap_hip(D.b_hc, D.b_tap, n_embd, n_hc, b_nb_, b_lo, n_keep, row0, rows_cap,
+    batch_hc_tap_hip(D.b_hc, D.b_tap_s[slot_], n_embd, n_hc, b_nb_, b_lo, n_keep, row0, rows_cap,
                      (uint32_t)stride, slot * n_embd, D.stream);
   }
   return true;
@@ -5287,8 +5293,8 @@ bool DenseGpu::draft_proj(int32_t h, int32_t norm_w, uint64_t rows, uint64_t col
   b_nb_ = kNarrowTok; b_live_ = n;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
-    if (!D.b_dxt || !D.b_dx || !D.b_dm || !D.b_tap) return false;
-    if ((size_t)(tap_row0 + n) * cols * sizeof(float) > D.tap_bytes) return false;
+    if (!D.b_dxt || !D.b_dx || !D.b_dm || !D.b_tap_s[slot_]) return false;
+    if ((size_t)(tap_row0 + n) * cols * sizeof(float) > D.tap_bytes_s[slot_]) return false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
     // The padding columns are transposed and multiplied like every other; zeroing the source is
     // what keeps them finite.
@@ -5297,7 +5303,7 @@ bool DenseGpu::draft_proj(int32_t h, int32_t norm_w, uint64_t rows, uint64_t col
     // written by batch_hc_tap as the target ran — so the tap's rows are a contiguous run and this is
     // a device-to-device copy of one. It replaces an H2D of a host plane whose bytes this card had
     // computed itself, and the drain that used to follow it.
-    AFF_HIP_CHECK(hipMemcpyAsync(D.b_dxt, D.b_tap + (size_t)tap_row0 * cols,
+    AFF_HIP_CHECK(hipMemcpyAsync(D.b_dxt, D.b_tap_s[slot_] + (size_t)tap_row0 * cols,
                                  (size_t)n * cols * sizeof(float), hipMemcpyDeviceToDevice,
                                  D.stream));
     batch_transpose_hip(D.b_dxt, D.b_dx, (uint32_t)cols, kNarrowTok, 0, D.stream);
