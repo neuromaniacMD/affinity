@@ -511,6 +511,29 @@ bool tp_init(TpContext* ctx, size_t max_floats, std::string* err, ihipStream_t* 
   return true;
 }
 
+void tp_reset_seq(TpContext& ctx) {
+  for (size_t r = 0; r < ctx.ranks; ++r) {
+    if (ctx.seq[r]) {
+      set_device(ctx.dev[r]);
+      // Zero the flags too: the protocol checks flag values against the sequence counter,
+      // and a stale flag from a previous block could satisfy the wait prematurely.
+      if (ctx.flags[r])
+        AFF_HIP_CHECK(hipMemsetAsync(ctx.flags[r], 0,
+                     (size_t)(ctx.ranks - 1) * kTpMaxBlocks * sizeof(unsigned),
+                     (hipStream_t)ctx.stream[r]));
+      set_device(ctx.dev[r]);
+      AFF_HIP_CHECK(hipMemsetAsync(ctx.seq[r], 0, kTpMaxBlocks * sizeof(unsigned),
+                                   (hipStream_t)ctx.stream[r]));
+    }
+    // fseq is a 2-element array (fold path, 2 ranks only). Do not index past it.
+    if (r < 2 && ctx.fseq[r]) {
+      set_device(ctx.dev[r]);
+      AFF_HIP_CHECK(hipMemsetAsync(ctx.fseq[r], 0, kTpMaxBlocks * sizeof(unsigned),
+                                   (hipStream_t)ctx.stream[r]));
+    }
+  }
+}
+
 void tp_check(const TpContext& ctx) {
   if (!ctx.ready || !ctx.timeout) return;
   const unsigned t = *ctx.timeout;

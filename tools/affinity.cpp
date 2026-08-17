@@ -1834,7 +1834,7 @@ int main(int argc, char** argv) {
       model.note_block(nd, k, match.data());
       // Positions P..P+k are real; P+k+1 holds vb.greedy[k] and is fed by the next block.
       model.rollback(&st, P + k + 1);
-      if (n_slots_gt1) dense_gpu.sync_devices();   // no async work crosses into the next slot
+      if (n_slots_gt1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       if (slot_dbg) { tap_hash_prev = dense_gpu.tap_hash_debug();
                       kv_hash_prev = dense_gpu.kv_hash_debug(dbg_layer); }
       step.unlock();                    // the cards are free from here; the rest is host-side
@@ -2386,7 +2386,7 @@ int main(int argc, char** argv) {
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, promote - from, &st, nullptr,
                                                 nullptr, nullptr, true, &blk);
-      if (dense_gpu.n_slots() > 1) dense_gpu.sync_devices();
+      if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       watch_prefill(false);
       if (!pre_ok) {
         res->finish_reason = "stop";
@@ -2408,7 +2408,7 @@ int main(int argc, char** argv) {
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
                                                 nullptr, &logits, true, &blk);
-      if (dense_gpu.n_slots() > 1) dense_gpu.sync_devices();
+      if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       watch_prefill(false);
       if (!pre_ok) {
         res->finish_reason = "stop";

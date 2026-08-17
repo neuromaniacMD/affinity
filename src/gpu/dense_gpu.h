@@ -461,6 +461,10 @@ private:
   // next slot reuses the shared scratch. The block already syncs the compute stream for the head
   // readback; this covers the other streams. See slots(3/3g).
   void sync_devices();
+  // Zero the TP all-reduce sequence counters so the next block's collectives start fresh.
+  // Interleaved slots share the seq counters; without a reset, their sequence numbers
+  // interleave and break the double-buffer protocol. Call after sync_devices().
+  void tp_reset_seq();
   // DEBUG ONLY (AFF_SLOT_DEBUG): FNV-1a over the head of the CURRENT slot's DSpark tap plane.
   // The draft reads the first few rows of it at the start of every block, so hashing the head is
   // enough to answer "did a foreign block change my plane". Copies D2H and syncs; never on a

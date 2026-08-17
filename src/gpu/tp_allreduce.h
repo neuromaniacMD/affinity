@@ -204,4 +204,12 @@ void tp_sync(TpContext& ctx);
 // scratch, and a caller that could handle it would have to reproduce this argument.
 void tp_check(const TpContext& ctx);
 
+// Zero every rank's per-block sequence counters and the flags. Call between independent
+// collectives that must not share the double-buffer protocol's sequence — e.g. between
+// two slots' speculative blocks, whose all-reduces would otherwise interleave their
+// sequence numbers on the same device and break the |s_A - s_B| <= 1 invariant the
+// protocol relies on. Both the main counters and the fold counters are cleared. Requires
+// the caller to have synced (the counters are what an in-flight collective is using).
+void tp_reset_seq(TpContext& ctx);
+
 } // namespace aff
