@@ -1,3 +1,4 @@
+# NOTE: see the appended FINDINGS section at the end for the open acceptance-collapse hunt
 # slots(3/3) — implementation plan: interleaved execution
 
 ## The finding that shapes this
@@ -55,3 +56,35 @@ The risk is concentrated in (3) and (4) — everything else is bookkeeping.
    kernel (base = `slot*stride`; the kernel already indirects per token for `n_comp_v` and
    admissions), and a gather step that collects N sequences into one forward. Projected
    ~1.5x (N=2) / ~2.1x (N=4) aggregate, per-request decode ~67 / ~46 t/s.
+slots(3/3c): rule out content cross-contamination as the cause of the acceptance collapse
+
+Two concurrent requests with IDENTICAL prompts collapse exactly as much as two
+different ones: aggregate 0.55x vs 0.56x, acceptance 34.2% solo -> ~9% while
+interleaved. If a draft were simply reading its neighbour's tap or hidden state,
+identical greedy sequences would hold identical state and draft correctly, so
+acceptance would have recovered. It does not.
+
+So the draft is not being fed the WRONG sequence's data — something it depends on
+across blocks is being invalidated when a foreign block runs in between.
+
+Verified per-slot and therefore exonerated:
+  * draft KV       draft_kv -> batch_kv_commit -> a_raw_s[slot_]
+  * draft attend   draft_attend reads a_raw_s[slot_][layer]
+  * tap plane      b_tap_s[slot_] (fixed in 3/3a)
+  * indexer keys   a_idx_layer_/b_idx_layer_ per slot
+Also note hc_tap's `slot` argument is the tap LAYER index, not a sequence slot —
+unrelated.
+
+Also corrected: the per-request counters added in 3/3b are derived from
+model.profile(), which is global and cumulative, so while two requests overlap
+each delta includes the other slot's blocks. The aggregate throughput comparison
+is unaffected and the global acceptance collapse is real, but per-request
+attribution during overlap should not be read as exact.
+
+Next diagnostic: checksum the tap plane and the draft KV rows for a slot
+immediately before and after a foreign block runs. That distinguishes "the bytes
+were corrupted" from "the bytes are intact and the draft is being driven wrong",
+which is the fork this hunt is stuck on.
+
+Standing result is unchanged: interleaving is correct (isolation passes) and free
+with dspark off (0.97x aggregate); with dspark on it costs ~45% until this lands.
