@@ -1729,6 +1729,7 @@ int main(int argc, char** argv) {
     const bool n_slots_gt1 = dense_gpu.n_slots() > 1;
     uint64_t tap_hash_prev = 0, kv_hash_prev = 0;
     const uint32_t dbg_layer = dense_gpu.kv_layers_debug() ? dense_gpu.kv_layers_debug() - 1u : 0u;
+    uint32_t my_blocks = 0, my_accepted = 0;   // LOCAL, not model.profile(): uncontaminated
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
     uint32_t next = first, generated = 0;
     bool stop = false;
@@ -1829,6 +1830,7 @@ int main(int argc, char** argv) {
           gs += std::to_string(!sc ? vb.greedy[i] : vb.draws[i].tok) + (i + 1 < nd ? "," : "");
         aff::ui::err("slot %u VERIFY P=%u k=%u target=[%s]\n", slot, P, k, gs.c_str());
       }
+      my_blocks++; my_accepted += k;
       model.note_block(nd, k, match.data());
       // Positions P..P+k are real; P+k+1 holds vb.greedy[k] and is fed by the next block.
       model.rollback(&st, P + k + 1);
@@ -1893,6 +1895,9 @@ int main(int argc, char** argv) {
       // placement report are the result of the run and all of them still get printed.
       if (dash.quit_requested()) stop = true;
     }
+    if (std::getenv("AFF_SLOT_DEBUG"))
+      aff::ui::err("LOCAL slot %u: %u blocks, %u accepted (%.2f tok/blk), %u generated\n", slot, my_blocks,
+                   my_accepted, my_blocks ? (double)generated / my_blocks : 0.0, generated);
     return generated;
   };
 
