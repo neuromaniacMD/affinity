@@ -446,7 +446,14 @@ private:
   std::atomic<bool> kv_grow_run_{false};
   std::thread kv_grow_;
   std::string kv_grow_err_;
-  int64_t  a_idx_layer_ = -1;        // the layer whose admissions b_allow currently holds
+  int64_t  a_idx_layer_ = -1;        // the layer whose admissions a_allow/a_adm hold, for the
+                                     // CURRENT decode token only; hc_seed invalidates it
+  int64_t  b_idx_layer_ = -1;        // batch twin: the layer whose admissions b_allow/b_adm/b_admn
+                                     // hold, for the CURRENT chunk only; batch_begin invalidates it.
+                                     // One shared key let a stale layer match hand batch_attend
+                                     // counts written for a DIFFERENT chunk length — slots past that
+                                     // chunk's n are uninitialised VRAM, and a garbage count walks
+                                     // the gather list off the mapped world. See Forgejo #179.
   bool     a_idx_gather_ = false;    // ...and whether it also left the compacted list beside it
   uint32_t a_idx_topk_ = 0;          // that layer's index_topk, the list's largest possible length
   uint32_t i_tile_ = 1;              // tokens a pass through the indexer's score plane; see idx_grow
@@ -496,7 +503,7 @@ private:
                        uint32_t n_keys, uint32_t n_mask, uint32_t topk, uint32_t pos,
                        uint32_t n_rot, RopeDerived rope);
   // Tells attn_q to keep qr_norm in VRAM for indexer_one instead of copying it to the host.
-  void     set_idx_want_qrn(bool v) { idx_want_qrn_ = v; a_idx_layer_ = -1; }
+  void     set_idx_want_qrn(bool v) { idx_want_qrn_ = v; a_idx_layer_ = -1; b_idx_layer_ = -1; }
   // Scores every compressed row against every head, ReLU-weights them and takes the top `topk`,
   // leaving the admission mask on device where batch_attend already reads it. Must be followed by
   // batch_attend for the same tokens.

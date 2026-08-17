@@ -2176,6 +2176,9 @@ bool DenseGpu::hc_init(uint32_t n_embd, uint32_t n_hc, std::string* err) {
 }
 
 void DenseGpu::hc_seed(const float* embed, uint32_t n_embd, uint32_t n_hc) {
+  // A new token: a_allow/a_adm/a_admn hold the PREVIOUS token's admissions. indexer_one re-arms
+  // this per layer when the indexer engages; without it a stale layer match reads old admissions.
+  a_idx_layer_ = -1;
   if (!hc_ok_) return;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
@@ -3376,6 +3379,8 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
                    "admitted list, chunk", err) ||
           !hip_try(hipMalloc(&D.b_admn, (size_t)cap * sizeof(uint32_t)), "admitted counts", err))
         return false;
+      AFF_HIP_CHECK(hipMemset(D.a_admn, 0, sizeof(uint32_t)));
+      AFF_HIP_CHECK(hipMemset(D.b_admn, 0, (size_t)cap * sizeof(uint32_t)));
     }
   }
   return true;
@@ -3480,6 +3485,9 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
                            uint32_t n_hc) {
   AFF_TRACE(20);
   if (!b_cap_ || !n_live) return false;
+  // A new chunk: whatever admissions the b_* buffers hold were written for a previous chunk's
+  // token count and are garbage past it. batch_indexer re-arms this for its own layer.
+  b_idx_layer_ = -1;
   // The SAME function batch_init sized the arena with, deliberately. As a second copy of the
   // expression it drifted: a chunk asked for a stride larger than its own arena, was refused here,
   // and the caller quietly fell back to one token at a time — so prefill reported decode's rate,
@@ -4333,7 +4341,7 @@ bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp,
                         gather ? D.b_admn + t0 : nullptr, kAdmCap);
     }
   }
-  a_idx_layer_ = (int64_t)layer;
+  b_idx_layer_ = (int64_t)layer;
   a_idx_gather_ = topk <= kAdmCap;
   a_idx_topk_ = topk;
   ++st_.calls;
@@ -4349,7 +4357,7 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
   // The indexer writes b_allow for its OWN layer only. Keyed by layer rather than a bare flag: a
   // stale one would hand attention the previous layer's admissions, which is not a crash — it is a
   // model that quietly attends to the wrong rows.
-  const bool dev_mask = a_idx_layer_ == (int64_t)layer;
+  const bool dev_mask = b_idx_layer_ == (int64_t)layer;
   uint32_t n_comp_max = 0;
   if (n_comp) for (uint32_t t = 0; t < n; ++t) n_comp_max = std::max(n_comp_max, n_comp[t]);
   if (n_comp_max > a_maxcomp_) return false;          // caller falls back rather than truncating
