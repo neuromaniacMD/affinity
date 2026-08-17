@@ -641,6 +641,7 @@ bool DenseGpu::init(uint64_t max_rows, uint64_t max_cols, std::string* err, size
   impl_->dev.resize(use);
   // Every per-sequence vector is slot-major; give each its outer dimension before anything
   // indexes [slot_]. n_slots_ is 1 unless --slots raised it.
+  init_slot_keys();
   for (auto& D : impl_->dev) {
     D.a_raw_s.resize(n_slots_);   D.a_comp_s.resize(n_slots_);
     D.a_comp_span_s.resize(n_slots_);
@@ -2190,7 +2191,7 @@ bool DenseGpu::hc_init(uint32_t n_embd, uint32_t n_hc, std::string* err) {
 void DenseGpu::hc_seed(const float* embed, uint32_t n_embd, uint32_t n_hc) {
   // A new token: a_allow/a_adm/a_admn hold the PREVIOUS token's admissions. indexer_one re-arms
   // this per layer when the indexer engages; without it a stale layer match reads old admissions.
-  a_idx_layer_ = -1;
+  a_idx_layer_[slot_] = -1;
   if (!hc_ok_) return;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
@@ -2608,37 +2609,47 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
     uint64_t comp_now = 0;
     for (uint32_t l = 0; l < n_layer; ++l)
       comp_now += (uint64_t)comp_rows_for(l, a_init_pos_) * rb;
-    const uint64_t need = raw_b * n_layer + comp_now +
+    const uint64_t need = (raw_b * n_layer + comp_now) * n_slots_ +
                           (uint64_t)a_hpr_ * width * 2 * sizeof(float);
     if (freeb < need + kKvAllocHeadroom) {
       if (err) *err = "KV cache needs " + std::to_string(need >> 20) + " MiB on card " +
                       std::to_string(d) + ", only " + std::to_string(freeb >> 20) + " free";
       return false;
     }
-    D.a_raw_s[slot_].assign(n_layer, nullptr);
-    D.a_comp_s[slot_].assign(n_layer, nullptr);
-    D.a_sink.assign(n_layer, nullptr);
-    D.a_comp_span_s[slot_].clear();
-    D.a_comp_span_s[slot_].resize(n_layer);
+    D.a_sink.assign(n_layer, nullptr);            // shared model state, not per-sequence
+    // The slot dimension is sized HERE, not at device creation: --slots is parsed after the
+    // devices exist, so init()'s sizing ran while n_slots_ was still 1.
+    D.a_raw_s.resize(n_slots_);   D.a_comp_s.resize(n_slots_);
+    D.a_comp_span_s.resize(n_slots_);
+    D.a_idx8_s.resize(n_slots_);  D.a_idxs_s.resize(n_slots_);
+    D.c_hkv_s.resize(n_slots_);   D.c_hsc_s.resize(n_slots_);
+    D.ci_hkv_s.resize(n_slots_);  D.ci_hsc_s.resize(n_slots_);
+    for (uint32_t sl = 0; sl < n_slots_; ++sl) {
+      D.a_raw_s[sl].assign(n_layer, nullptr);
+      D.a_comp_s[sl].assign(n_layer, nullptr);
+      D.a_comp_span_s[sl].clear();
+      D.a_comp_span_s[sl].resize(n_layer);
+    }
     // ONE zeroing stream a card, shared by every layer's span. Per-span streams cost 640 MiB of
     // host RAM across 86 of them, which comes out of the expert pool and strands experts on the
     // SSD tier — the pool is sized from what is left after everything else the process holds.
     if (!D.a_kv_zero)
       AFF_HIP_CHECK(hipStreamCreateWithFlags(&D.a_kv_zero, hipStreamNonBlocking));
+    for (uint32_t sl = 0; sl < n_slots_; ++sl)
     for (uint32_t l = 0; l < n_layer; ++l) {
-      AFF_HIP_CHECK(hipMalloc(&D.a_raw_s[slot_][l], raw_b));
-      AFF_HIP_CHECK(hipMemset(D.a_raw_s[slot_][l], 0, raw_b));
+      AFF_HIP_CHECK(hipMalloc(&D.a_raw_s[sl][l], raw_b));
+      AFF_HIP_CHECK(hipMemset(D.a_raw_s[sl][l], 0, raw_b));
       const uint64_t cb = (uint64_t)a_comp_rows_[l] * rb;
       if (cb) {
         std::string verr;
-        if (!D.a_comp_span_s[slot_][l].reserve(D.id, cb, &verr) ||
-            !D.a_comp_span_s[slot_][l].commit_to((uint64_t)comp_rows_for(l, a_init_pos_) * rb,
+        if (!D.a_comp_span_s[sl][l].reserve(D.id, cb, &verr) ||
+            !D.a_comp_span_s[sl][l].commit_to((uint64_t)comp_rows_for(l, a_init_pos_) * rb,
                                         D.a_kv_zero, &verr)) {
           if (err) *err = "KV layer " + std::to_string(l) + " on card " + std::to_string(d) +
-                          ": " + verr;
+                          " slot " + std::to_string(sl) + ": " + verr;
           return false;
         }
-        D.a_comp_s[slot_][l] = static_cast<uint8_t*>(D.a_comp_span_s[slot_][l].ptr());
+        D.a_comp_s[sl][l] = static_cast<uint8_t*>(D.a_comp_span_s[sl][l].ptr());
       }
     }
     AFF_HIP_CHECK(hipMalloc(&D.a_q, (uint64_t)a_hpr_ * width * sizeof(float)));
@@ -2647,7 +2658,7 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
     // What is BACKED, not what is reserved: the reservation is address space and the whole point
     // of it is that it costs no VRAM. A ledger that counted the reservation would report 4.3 GiB a
     // card that placement is in fact using for experts.
-    st_.kv_bytes += raw_b * n_layer + comp_now;
+    st_.kv_bytes += (raw_b * n_layer + comp_now) * n_slots_;
   }
   attn_ok_ = true;
   // Everything the loader handed over before this point, now that there is somewhere to put it.
@@ -2864,7 +2875,7 @@ bool DenseGpu::attn_run(uint32_t layer, const float* q, const uint8_t* allowed, 
     // The indexer writes a_allow for its OWN layer only. Keyed by layer rather than a bare flag: a
     // stale one would hand attention the previous layer's admissions, which is not a crash — it is
     // a model that quietly attends to the wrong rows.
-    const bool dev_mask = a_idx_layer_ == (int64_t)layer && n_comp;
+    const bool dev_mask = a_idx_layer_[slot_] == (int64_t)layer && n_comp;
     if (!dev_mask && allowed && n_comp) {
       // The compressed-row mask is per TOKEN, not per head, so both cards get all of it.
       AFF_HIP_CHECK(hipMemcpyAsync(D.a_allow, allowed, n_comp, hipMemcpyHostToDevice, D.stream));
@@ -2888,12 +2899,12 @@ bool DenseGpu::attn_run(uint32_t layer, const float* q, const uint8_t* allowed, 
       // GATHERED when the indexer left a list for this layer: attention walks the sliding window
       // plus at most index_topk admitted rows rather than every compressed row in the cache. At
       // 123K context that is 640 key rows against 30848.
-      const bool gather = dev_mask && a_idx_gather_;
+      const bool gather = dev_mask && a_idx_gather_[slot_];
       mqa_attend_flash_hip(D.a_q, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][layer], gather ? nullptr : mask,
                            gather ? D.a_admn : nullptr, gather ? 0u : n_comp,
                            D.a_sink[layer],
                            D.a_out, 0, 1, 1, pos, a_sliding_, a_ring_, a_maxcomp_, a_hpr_, scale,
-                           D.stream, /*q_bf16=*/false, &D.fsplit, gather ? a_idx_topk_ : 0u,
+                           D.stream, /*q_bf16=*/false, &D.fsplit, gather ? a_idx_topk_[slot_] : 0u,
                            gather ? D.a_adm : nullptr, kAdmCap);
     } else {
       mqa_attend_hip(a_dt_, D.a_q, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][layer], mask, D.a_sink[layer], D.a_out,
@@ -3499,7 +3510,7 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
   if (!b_cap_ || !n_live) return false;
   // A new chunk: whatever admissions the b_* buffers hold were written for a previous chunk's
   // token count and are garbage past it. batch_indexer re-arms this for its own layer.
-  b_idx_layer_ = -1;
+  b_idx_layer_[slot_] = -1;
   // The SAME function batch_init sized the arena with, deliberately. As a second copy of the
   // expression it drifted: a chunk asked for a stride larger than its own arena, was refused here,
   // and the caller quietly fell back to one token at a time — so prefill reported decode's rate,
@@ -3851,13 +3862,18 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
   Impl::Dev& D = *(Impl::Dev*)devp;
   const uint32_t nl = (uint32_t)D.a_comp_s[slot_].size();
   if (layer >= nl) return false;
+  // Shared per-layer state: sized ONCE. Re-running this when a second slot first touches the
+  // layer would null pointers slot 0 already allocated.
+  if (D.c_ratio.empty()) {
+    D.c_ape.assign(nl, nullptr);  D.c_norm.assign(nl, nullptr);
+    D.ci_ape.assign(nl, nullptr); D.ci_norm.assign(nl, nullptr);
+    D.c_ratio.assign(nl, 0u);
+  }
+  // Per-sequence state: sized once PER SLOT, lazily, on that slot's first touch.
   if (D.c_hkv_s[slot_].empty()) {
     D.c_hkv_s[slot_].assign(nl, nullptr);  D.c_hsc_s[slot_].assign(nl, nullptr);
     D.ci_hkv_s[slot_].assign(nl, nullptr); D.ci_hsc_s[slot_].assign(nl, nullptr);
-    D.c_ape.assign(nl, nullptr);  D.c_norm.assign(nl, nullptr);
-    D.ci_ape.assign(nl, nullptr); D.ci_norm.assign(nl, nullptr);
     D.a_idx8_s[slot_].assign(nl, nullptr); D.a_idxs_s[slot_].assign(nl, nullptr);
-    D.c_ratio.assign(nl, 0u);
   }
   if (D.c_hkv_s[slot_][layer]) return true;
   const uint32_t hist = comp_hist(ratio);
@@ -4276,9 +4292,9 @@ bool DenseGpu::indexer_one(uint32_t layer, int32_t h, uint64_t qr, uint32_t n_he
                       n_mask > a_maxcomp_ ? a_maxcomp_ : n_mask, topk, st, &D.topk,
                       gather ? D.a_adm : nullptr, gather ? D.a_admn : nullptr, kAdmCap);
   }
-  a_idx_layer_ = (int64_t)layer;
-  a_idx_gather_ = topk <= kAdmCap;
-  a_idx_topk_ = topk;
+  a_idx_layer_[slot_] = (int64_t)layer;
+  a_idx_gather_[slot_] = topk <= kAdmCap;
+  a_idx_topk_[slot_] = topk;
   ++st_.calls;
   return true;
 }
@@ -4353,9 +4369,9 @@ bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp,
                         gather ? D.b_admn + t0 : nullptr, kAdmCap);
     }
   }
-  b_idx_layer_ = (int64_t)layer;
-  a_idx_gather_ = topk <= kAdmCap;
-  a_idx_topk_ = topk;
+  b_idx_layer_[slot_] = (int64_t)layer;
+  a_idx_gather_[slot_] = topk <= kAdmCap;
+  a_idx_topk_[slot_] = topk;
   ++st_.calls;
   return true;
 }
@@ -4369,7 +4385,7 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
   // The indexer writes b_allow for its OWN layer only. Keyed by layer rather than a bare flag: a
   // stale one would hand attention the previous layer's admissions, which is not a crash — it is a
   // model that quietly attends to the wrong rows.
-  const bool dev_mask = b_idx_layer_ == (int64_t)layer;
+  const bool dev_mask = b_idx_layer_[slot_] == (int64_t)layer;
   uint32_t n_comp_max = 0;
   if (n_comp) for (uint32_t t = 0; t < n; ++t) n_comp_max = std::max(n_comp_max, n_comp[t]);
   if (n_comp_max > a_maxcomp_) return false;          // caller falls back rather than truncating
@@ -4403,7 +4419,7 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
     // walks keys on the VALU. In isolation that is two orders of magnitude at short context, and the
     // difference between running and not at long context.
     const bool flash = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
-    const bool gather = dev_mask && a_idx_gather_;
+    const bool gather = dev_mask && a_idx_gather_[slot_];
     if (flash)
       mqa_attend_flash_hip(D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][layer],
                            gather ? nullptr
@@ -4412,7 +4428,7 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
                            gather ? D.b_admn + b0 : D.b_ncomp, /*n_comp1=*/0u, D.a_sink[layer],
                            D.b_htm, b0, n, b_nb_, pos0,
                            a_sliding_, a_ring_, a_maxcomp_, a_hpr_, scale, D.stream,
-                           /*q_bf16=*/true, &D.fsplit, gather ? a_idx_topk_ : n_comp_max,
+                           /*q_bf16=*/true, &D.fsplit, gather ? a_idx_topk_[slot_] : n_comp_max,
                            gather ? D.b_adm + (size_t)b0 * kAdmCap : nullptr, kAdmCap);
     else
       mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][layer],

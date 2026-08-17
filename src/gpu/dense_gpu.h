@@ -450,6 +450,7 @@ private:
   // How many independent sequences the device state holds, and which one the current call acts
   // on. Every per-sequence buffer in Impl::Dev is slot-major. n_slots_ == 1 is the historical
   // single-sequence engine, bit-for-bit: the slot dimension is then a vector of one.
+  static constexpr uint32_t kMaxSlots = 16;
   uint32_t n_slots_ = 1;
   uint32_t slot_ = 0;
 
@@ -461,19 +462,28 @@ private:
   uint32_t slot() const { return slot_; }
   // Called once, before init(): the slot count is a load-time property because every per-slot
   // buffer is sized from it.
-  bool set_n_slots(uint32_t n) { if (!n || n > 16) return false; n_slots_ = n; return true; }
+  bool set_n_slots(uint32_t n) { if (!n || n > kMaxSlots) return false; n_slots_ = n; return true; }
+  // Every slot starts with no valid admissions, exactly as the single-sequence engine did.
+  void init_slot_keys() {
+    for (uint32_t i = 0; i < kMaxSlots; ++i) {
+      a_idx_layer_[i] = -1; b_idx_layer_[i] = -1;
+      a_idx_gather_[i] = false; a_idx_topk_[i] = 0;
+    }
+  }
 
  private:
-  int64_t  a_idx_layer_ = -1;        // the layer whose admissions a_allow/a_adm hold, for the
+  // Per SLOT — these describe a sequence's device-side admissions, so two sequences sharing one
+  // key would reintroduce Forgejo #179 across slots rather than across chunks.
+  int64_t  a_idx_layer_[kMaxSlots];  // the layer whose admissions a_allow/a_adm hold, for the
                                      // CURRENT decode token only; hc_seed invalidates it
-  int64_t  b_idx_layer_ = -1;        // batch twin: the layer whose admissions b_allow/b_adm/b_admn
+  int64_t  b_idx_layer_[kMaxSlots];  // batch twin: the layer whose admissions b_allow/b_adm/b_admn
                                      // hold, for the CURRENT chunk only; batch_begin invalidates it.
                                      // One shared key let a stale layer match hand batch_attend
                                      // counts written for a DIFFERENT chunk length — slots past that
                                      // chunk's n are uninitialised VRAM, and a garbage count walks
                                      // the gather list off the mapped world. See Forgejo #179.
-  bool     a_idx_gather_ = false;    // ...and whether it also left the compacted list beside it
-  uint32_t a_idx_topk_ = 0;          // that layer's index_topk, the list's largest possible length
+  bool     a_idx_gather_[kMaxSlots];  // ...and whether it also left the compacted list beside it
+  uint32_t a_idx_topk_[kMaxSlots];    // that layer's index_topk, the list's largest possible length
   uint32_t i_tile_ = 1;              // tokens a pass through the indexer's score plane; see idx_grow
   bool     idx_want_qrn_ = false;    // attn_q keeps qr_norm in VRAM for the single-token indexer
   uint32_t b_norm_rows_ = 0;            // n_embd, remembered by hc_pre for the lazy norm fetch
@@ -521,7 +531,7 @@ private:
                        uint32_t n_keys, uint32_t n_mask, uint32_t topk, uint32_t pos,
                        uint32_t n_rot, RopeDerived rope);
   // Tells attn_q to keep qr_norm in VRAM for indexer_one instead of copying it to the host.
-  void     set_idx_want_qrn(bool v) { idx_want_qrn_ = v; a_idx_layer_ = -1; b_idx_layer_ = -1; }
+  void     set_idx_want_qrn(bool v) { idx_want_qrn_ = v; a_idx_layer_[slot_] = -1; b_idx_layer_[slot_] = -1; }
   // Scores every compressed row against every head, ReLU-weights them and takes the top `topk`,
   // leaving the admission mask on device where batch_attend already reads it. Must be followed by
   // batch_attend for the same tokens.

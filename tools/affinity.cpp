@@ -280,6 +280,9 @@ int main(int argc, char** argv) {
   // Positions the KV cache is sized for. 1M is the model's maximum and the default, and since the
   // cache became lazily backed it is very nearly free: --kv-size reserves address space, and only
   // --kv-commit below spends VRAM. Lowering it no longer buys residency.
+  // Independent sequences the engine holds device state for. 1 is the historical engine.
+  // --kv-size is PER SLOT, so N slots cost N times the KV: the budget is total positions.
+  uint32_t kSlots = 1;
   uint64_t kMaxKvPositions = 1048576;
   // Positions the compressed cache is BACKED with at load. The rest of --kv-size is reserved
   // address space that costs no VRAM until the sequence reaches it, and the difference goes to the
@@ -418,6 +421,7 @@ int main(int argc, char** argv) {
     else if (a == "--gpu-headroom-mib") gpu_headroom_mib = std::strtod(nxt(), nullptr);
     else if (a == "--keepalive-us") keepalive_us = std::strtod(nxt(), nullptr);
     else if (a == "--gpus") kGpuCount = (size_t)std::strtoull(nxt(), nullptr, 10);
+    else if (a == "--slots") kSlots = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--kv-size") kMaxKvPositions = std::strtoull(nxt(), nullptr, 10);
     else if (a == "--kv-commit") kKvCommitPositions = std::strtoull(nxt(), nullptr, 10);
     else if (a == "--kv-margin") kKvMarginPositions = std::strtoull(nxt(), nullptr, 10);
@@ -505,6 +509,12 @@ int main(int argc, char** argv) {
         "      --kv-size N             KV cache positions (default 1048576, the model's maximum).\n"
         "                              Address space, not VRAM — the cache is backed lazily, so\n"
         "                              lowering this does not buy residency. --kv-commit does.\n"
+        "      --slots N               independent sequences to hold device state for (default 1).\n"
+        "                              --kv-size is PER SLOT, so N slots cost N times the KV and\n"
+        "                              the budget is TOTAL positions: 4 slots of 128K costs what\n"
+        "                              one slot of 512K does. Above 1 requires --kv-commit ==\n"
+        "                              --kv-size (a slot is fully backed; the grower is per-\n"
+        "                              sequence and does not run).\n"
         "      --kv-commit N           positions BACKED with VRAM at load (default 65536). The\n"
         "                              rest of --kv-size costs no VRAM until the sequence reaches\n"
         "                              it, and the difference goes to the expert slab: 621 more\n"
@@ -873,6 +883,22 @@ int main(int argc, char** argv) {
       aff::ui::out("hidden state: on host (%s)\n", herr.c_str());
     // FP8R is the only layout the flash attention kernel reads; the enum's other arms exist for
     // aff-verify's reference paths, not for a runtime choice.
+    if (kSlots > 1) {
+      if (kKvCommitPositions != kMaxKvPositions) {
+        aff::ui::fatal("--slots %u needs --kv-commit == --kv-size (%llu != %llu): a slot is backed "
+                       "in full at load, because the KV grower tracks one sequence.\n",
+                       kSlots, (unsigned long long)kKvCommitPositions,
+                       (unsigned long long)kMaxKvPositions);
+        return 1;
+      }
+      if (!dense_gpu.set_n_slots(kSlots)) {
+        aff::ui::fatal("--slots %u out of range (1..16)\n", kSlots);
+        return 1;
+      }
+      aff::ui::out("slots: %u sequences, %llu positions each (%llu total)\n", kSlots,
+                   (unsigned long long)kMaxKvPositions,
+                   (unsigned long long)kMaxKvPositions * kSlots);
+    }
     if (dense_gpu.attn_init(c.n_layer + n_stage, c.n_head, c.head_dim, c.rope_dim, c.sliding,
                             comp_rows.data(), KvDtype::FP8R, kMaxKvPositions, kKvCommitPositions,
                             &kerr))
