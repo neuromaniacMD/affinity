@@ -5319,6 +5319,39 @@ bool DenseGpu::draft_proj(int32_t h, int32_t norm_w, uint64_t rows, uint64_t col
 // `kv_norm(wkv(main_x))`, roped at each position, into the stage's ring — one row per position that
 // has just become real. This is the ONLY way the target reaches the draft: the draft's residual
 // stream starts from the noise token's embedding and knows nothing else.
+uint32_t DenseGpu::kv_layers_debug() const {
+  if (!impl_ || impl_->dev.empty() || slot_ >= impl_->dev[0].a_raw_s.size()) return 0;
+  return (uint32_t)impl_->dev[0].a_raw_s[slot_].size();
+}
+
+uint64_t DenseGpu::kv_hash_debug(uint32_t layer) {
+  if (!impl_ || impl_->dev.empty()) return 0;
+  Impl::Dev& D = impl_->dev[0];
+  if (slot_ >= D.a_raw_s.size() || layer >= D.a_raw_s[slot_].size() || !D.a_raw_s[slot_][layer])
+    return 0;
+  const size_t n = std::min<size_t>((size_t)a_ring_ * kv_row_bytes(a_dt_, a_width_, a_rot_),
+                                    512u * 1024u);
+  std::vector<uint8_t> h(n);
+  AFF_HIP_CHECK(hipSetDevice(D.id));
+  AFF_HIP_CHECK(hipMemcpy(h.data(), D.a_raw_s[slot_][layer], n, hipMemcpyDeviceToHost));
+  uint64_t v = 1469598103934665603ull;
+  for (size_t i = 0; i < n; ++i) { v ^= h[i]; v *= 1099511628211ull; }
+  return v;
+}
+
+uint64_t DenseGpu::tap_hash_debug() {
+  if (!impl_ || impl_->dev.empty()) return 0;
+  Impl::Dev& D = impl_->dev[0];
+  if (slot_ >= D.b_tap_s.size() || !D.b_tap_s[slot_] || !D.tap_bytes_s[slot_]) return 0;
+  const size_t n = std::min<size_t>(D.tap_bytes_s[slot_], 512u * 1024u);
+  std::vector<uint8_t> h(n);
+  AFF_HIP_CHECK(hipSetDevice(D.id));
+  AFF_HIP_CHECK(hipMemcpy(h.data(), D.b_tap_s[slot_], n, hipMemcpyDeviceToHost));
+  uint64_t v = 1469598103934665603ull;
+  for (size_t i = 0; i < n; ++i) { v ^= h[i]; v *= 1099511628211ull; }
+  return v;
+}
+
 bool DenseGpu::draft_kv(uint32_t layer, int32_t kv, int32_t kvnorm, uint32_t n, uint32_t pos0,
                         uint64_t hidden, uint32_t width, uint32_t n_rot, RopeDerived rope,
                         float eps) {

@@ -456,6 +456,15 @@ private:
 
  public:
   uint32_t n_slots() const { return n_slots_; }
+  // DEBUG ONLY (AFF_SLOT_DEBUG): FNV-1a over the head of the CURRENT slot's DSpark tap plane.
+  // The draft reads the first few rows of it at the start of every block, so hashing the head is
+  // enough to answer "did a foreign block change my plane". Copies D2H and syncs; never on a
+  // shipping path.
+  uint64_t tap_hash_debug();
+  // DEBUG ONLY: same idea for the head of one layer's raw KV ring in the CURRENT slot. The DSpark
+  // stages are the trailing layers, so the last index is a draft stage.
+  uint64_t kv_hash_debug(uint32_t layer);
+  uint32_t kv_layers_debug() const;
   // Set BEFORE any call that touches sequence state. Refuses out of range rather than wrapping,
   // because a silently-wrong slot is another sequence's KV.
   bool set_slot(uint32_t s) { if (s >= n_slots_) return false; slot_ = s; return true; }

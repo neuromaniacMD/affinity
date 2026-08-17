@@ -1715,6 +1715,9 @@ int main(int argc, char** argv) {
       vb.top_k = sc->top_k;
       vb.min_p = sc->min_p;
     }
+    const bool slot_dbg = std::getenv("AFF_SLOT_DEBUG") != nullptr;
+    uint64_t tap_hash_prev = 0, kv_hash_prev = 0;
+    const uint32_t dbg_layer = dense_gpu.kv_layers_debug() ? dense_gpu.kv_layers_debug() - 1u : 0u;
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
     uint32_t next = first, generated = 0;
     bool stop = false;
@@ -1726,6 +1729,21 @@ int main(int argc, char** argv) {
       if (!dense_gpu.set_slot(slot)) {
         aff::ui::fatal("fatal: slot %u out of range\n", slot);
         std::abort();
+      }
+      if (slot_dbg && draft_on && seed_n) {
+        const uint64_t now = dense_gpu.tap_hash_debug();
+        if (tap_hash_prev && now != tap_hash_prev)
+          aff::ui::err("slot %u: TAP CHANGED between blocks (%016llx -> %016llx)\n", slot,
+                       (unsigned long long)tap_hash_prev, (unsigned long long)now);
+        else if (tap_hash_prev)
+          aff::ui::err("slot %u: tap intact across the gap (%016llx)\n", slot,
+                       (unsigned long long)now);
+        const uint64_t kvnow = dense_gpu.kv_hash_debug(dbg_layer);
+        if (kv_hash_prev && kvnow != kv_hash_prev)
+          aff::ui::err("slot %u: DRAFT KV CHANGED between blocks (%016llx -> %016llx)\n", slot,
+                       (unsigned long long)kv_hash_prev, (unsigned long long)kvnow);
+        else if (kv_hash_prev)
+          aff::ui::err("slot %u: draft kv intact\n", slot);
       }
       if (draft_on && seed_n && !model.dspark_seed(seed_n, seed_pos0)) {
         aff::ui::fatal("fatal: dspark_seed refused %u positions at %u\n", seed_n, seed_pos0);
@@ -1792,6 +1810,8 @@ int main(int argc, char** argv) {
       model.note_block(nd, k, match.data());
       // Positions P..P+k are real; P+k+1 holds vb.greedy[k] and is fed by the next block.
       model.rollback(&st, P + k + 1);
+      if (slot_dbg) { tap_hash_prev = dense_gpu.tap_hash_debug();
+                      kv_hash_prev = dense_gpu.kv_hash_debug(dbg_layer); }
       step.unlock();                    // the cards are free from here; the rest is host-side
       seed_n = vb.tap_rows ? k + 1 : 0u;
       seed_pos0 = P;
