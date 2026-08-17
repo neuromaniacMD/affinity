@@ -2489,6 +2489,11 @@ int main(int argc, char** argv) {
 
 
     run_view = {ids.size(), total_budget, hist.size(), 0.0, std::chrono::steady_clock::now()};
+    // Per-request speculation accounting. The counters are global and cumulative, so a snapshot
+    // either side of the call is this request's share — which is the only way to see acceptance
+    // collapse for ONE sequence while another is interleaved with it.
+    const Model::PhaseProfile p_before = model.profile();
+    const auto t_dec0 = std::chrono::steady_clock::now();
     const uint32_t made = spec_decode(slot, st, blk, ids.empty() ? 1u : ids.back(), hist, total_budget,
                                       /*ignore_eos_=*/false, [&](uint32_t id) {
       if ((int32_t)id == tok.eos()) return false;
@@ -2570,6 +2575,19 @@ int main(int argc, char** argv) {
     }
     // Truncation has to be distinguishable from a finished answer: a caller that sees "stop" on a
     // reply cut at max_tokens has no way to know it was cut, and will hand the fragment on as whole.
+    {
+      const Model::PhaseProfile& pa = model.profile();
+      const uint64_t nb = pa.blocks - p_before.blocks;
+      const uint64_t nd = pa.drafted - p_before.drafted;
+      const uint64_t na = pa.accepted - p_before.accepted;
+      const double el =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t_dec0).count();
+      aff::ui::err("slot %u: %u tok in %.2fs (%.1f t/s), %llu blocks, %llu drafted, %llu accepted "
+                   "(%.1f%%, %.2f tok/block)\n", slot, made, el, el > 0 ? made / el : 0.0,
+                   (unsigned long long)nb, (unsigned long long)nd, (unsigned long long)na,
+                   nd ? 100.0 * (double)na / (double)nd : 0.0,
+                   nb ? (double)made / (double)nb : 0.0);
+    }
     // The budget is spent inside spec_decode rather than in the sink below it, so the only thing
     // that says which way the run ended is whether it produced the whole allowance -- EOS and every
     // stop string return early and leave `made` short.
