@@ -2533,6 +2533,25 @@ int main(int argc, char** argv) {
     const ThinkingMode tm = eo.thinking_mode;
     ParsedMessage pm = parse_completion(raw + kEosStr, tm);
     if (tm == ThinkingMode::Thinking && raw.find(kThinkEnd) == std::string::npos) {
+      // The model sometimes writes a complete tool-call block inside the reasoning channel and
+      // EOSes without ever closing <think>. Its intent is a tool call, just in the wrong
+      // channel. Re-parse the raw text in Chat mode, which skips the think-block framing and
+      // reads straight to the <|DSML|tool_calls marker. If that yields tool calls, emit them
+      // as structured tool_calls instead of dropping the turn as a budget failure.
+      // Re-parse in Chat mode: it skips the think-block framing and reads straight to the
+      // <|DSML|tool_calls marker. Use its .content (the lead-in text, DSML stripped) as
+      // reasoning_content — NOT raw, which still holds the DSML block. Replaying raw back as
+      // reasoning_content would re-encode the tool-call markup INSIDE the next turn's
+      //  span and poison the model's view of its own prior turn.
+      ParsedMessage recovered = parse_completion(raw + kEosStr, ThinkingMode::Chat);
+      if (recovered.ok && !recovered.tool_calls.empty()) {
+        res->reasoning_content = recovered.content;
+        for (size_t i = 0; i < recovered.tool_calls.size(); ++i)
+          res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(i),
+                                               recovered.tool_calls[i].name,
+                                               recovered.tool_calls[i].arguments});
+        res->finish_reason = "tool_calls";
+      } else {
       // The reasoning allowance ran out before the block closed. That text is reasoning, not an
       // answer, and returning it as `content` hands the caller the model's deliberation as if it had
       // replied. Said on stderr too, because an empty content with finish_reason "length" is easy
@@ -2546,6 +2565,7 @@ int main(int argc, char** argv) {
                    floored              ? "--max-tokens-floor"
                    : req.has_max_tokens ? "max_tokens"
                                         : "the context left after the prompt");
+      }
     } else if (!pm.ok) {
       // A generation the parser cannot frame is still the model's output, and the client gets it
       // rather than an error: the alternative is discarding a turn because its markup was odd.
