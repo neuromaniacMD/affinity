@@ -2538,9 +2538,14 @@ int main(int argc, char** argv) {
       // channel. Re-parse the raw text in Chat mode, which skips the think-block framing and
       // reads straight to the <|DSML|tool_calls marker. If that yields tool calls, emit them
       // as structured tool_calls instead of dropping the turn as a budget failure.
+      // Re-parse in Chat mode: it skips the think-block framing and reads straight to the
+      // <|DSML|tool_calls marker. Use its .content (the lead-in text, DSML stripped) as
+      // reasoning_content — NOT raw, which still holds the DSML block. Replaying raw back as
+      // reasoning_content would re-encode the tool-call markup INSIDE the next turn's
+      //  span and poison the model's view of its own prior turn.
       ParsedMessage recovered = parse_completion(raw + kEosStr, ThinkingMode::Chat);
       if (recovered.ok && !recovered.tool_calls.empty()) {
-        res->reasoning_content = raw;
+        res->reasoning_content = recovered.content;
         for (size_t i = 0; i < recovered.tool_calls.size(); ++i)
           res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(i),
                                                recovered.tool_calls[i].name,
