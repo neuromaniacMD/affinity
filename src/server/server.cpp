@@ -232,10 +232,29 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
       if (*q == '{') {
         ChatMessage m;
         const size_t obj = (size_t)(q - body.c_str());
+        // Braces INSIDE a string are text, not structure. A tool result carrying truncated JSON --
+        // `head -c 200` on an API response is enough -- otherwise unbalances this count: the object
+        // never closes, `e` stays at `obj`, `sub` is the single byte "{", the role reads empty and
+        // the message is DROPPED. Every later message is then scanned from the wrong offset, so the
+        // conversation the model sees stops growing while the client keeps appending to it. The
+        // model answers the same stale prompt every turn, repeats itself, and finally degenerates.
+        // Silent, content-dependent, and worse the longer the session runs.
+        //
+        // find_top_key, raw_value and raw_elements all track strings already; this scanner is the
+        // one that did not. `if (depth &&` also stops a leading `}` from wrapping size_t to SIZE_MAX.
         size_t depth = 0, e = obj;
+        bool in_str = false, esc = false;
         for (size_t i = obj; i < body.size(); ++i) {
-          if (body[i] == '{') ++depth;
-          else if (body[i] == '}') { if (--depth == 0) { e = i; break; } }
+          const char c = body[i];
+          if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+          }
+          if (c == '"') { in_str = true; continue; }
+          if (c == '{') ++depth;
+          else if (c == '}') { if (depth && --depth == 0) { e = i; break; } }
         }
         const std::string sub = body.substr(obj, e - obj + 1);
         if (const char* r = find_top_key(sub, "role")) { const char* z = r; m.role = read_json_string(z); }
