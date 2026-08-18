@@ -446,9 +446,62 @@ private:
   std::atomic<bool> kv_grow_run_{false};
   std::thread kv_grow_;
   std::string kv_grow_err_;
-  int64_t  a_idx_layer_ = -1;        // the layer whose admissions b_allow currently holds
-  bool     a_idx_gather_ = false;    // ...and whether it also left the compacted list beside it
-  uint32_t a_idx_topk_ = 0;          // that layer's index_topk, the list's largest possible length
+  // ---- sequence slots ---------------------------------------------------------------------
+  // How many independent sequences the device state holds, and which one the current call acts
+  // on. Every per-sequence buffer in Impl::Dev is slot-major. n_slots_ == 1 is the historical
+  // single-sequence engine, bit-for-bit: the slot dimension is then a vector of one.
+  static constexpr uint32_t kMaxSlots = 16;
+  uint32_t n_slots_ = 1;
+  uint32_t slot_ = 0;
+
+ public:
+  uint32_t n_slots() const { return n_slots_; }
+  // Full device sync on every card. At a slot boundary this guarantees NONE of this sequence's
+  // async work (on any stream: compute, KV-zero, the staging rings) is still in flight when the
+  // next slot reuses the shared scratch. The block already syncs the compute stream for the head
+  // readback; this covers the other streams. See slots(3/3g).
+  void sync_devices();
+  // Zero the TP all-reduce sequence counters so the next block's collectives start fresh.
+  // Interleaved slots share the seq counters; without a reset, their sequence numbers
+  // interleave and break the double-buffer protocol. Call after sync_devices().
+  void tp_reset_seq();
+  // DEBUG ONLY (AFF_SLOT_DEBUG): FNV-1a over the head of the CURRENT slot's DSpark tap plane.
+  // The draft reads the first few rows of it at the start of every block, so hashing the head is
+  // enough to answer "did a foreign block change my plane". Copies D2H and syncs; never on a
+  // shipping path.
+  uint64_t tap_hash_debug();
+  // DEBUG ONLY: same idea for the head of one layer's raw KV ring in the CURRENT slot. The DSpark
+  // stages are the trailing layers, so the last index is a draft stage.
+  uint64_t kv_hash_debug(uint32_t layer);
+  uint32_t kv_layers_debug() const;
+  // Set BEFORE any call that touches sequence state. Refuses out of range rather than wrapping,
+  // because a silently-wrong slot is another sequence's KV.
+  bool set_slot(uint32_t s) { if (s >= n_slots_) return false; slot_ = s; return true; }
+  uint32_t slot() const { return slot_; }
+  // Called once, before init(): the slot count is a load-time property because every per-slot
+  // buffer is sized from it.
+  bool set_n_slots(uint32_t n) { if (!n || n > kMaxSlots) return false; n_slots_ = n; return true; }
+  // Every slot starts with no valid admissions, exactly as the single-sequence engine did.
+  void init_slot_keys() {
+    for (uint32_t i = 0; i < kMaxSlots; ++i) {
+      a_idx_layer_[i] = -1; b_idx_layer_[i] = -1;
+      a_idx_gather_[i] = false; a_idx_topk_[i] = 0;
+    }
+  }
+
+ private:
+  // Per SLOT — these describe a sequence's device-side admissions, so two sequences sharing one
+  // key would reintroduce Forgejo #179 across slots rather than across chunks.
+  int64_t  a_idx_layer_[kMaxSlots];  // the layer whose admissions a_allow/a_adm hold, for the
+                                     // CURRENT decode token only; hc_seed invalidates it
+  int64_t  b_idx_layer_[kMaxSlots];  // batch twin: the layer whose admissions b_allow/b_adm/b_admn
+                                     // hold, for the CURRENT chunk only; batch_begin invalidates it.
+                                     // One shared key let a stale layer match hand batch_attend
+                                     // counts written for a DIFFERENT chunk length — slots past that
+                                     // chunk's n are uninitialised VRAM, and a garbage count walks
+                                     // the gather list off the mapped world. See Forgejo #179.
+  bool     a_idx_gather_[kMaxSlots];  // ...and whether it also left the compacted list beside it
+  uint32_t a_idx_topk_[kMaxSlots];    // that layer's index_topk, the list's largest possible length
   uint32_t i_tile_ = 1;              // tokens a pass through the indexer's score plane; see idx_grow
   bool     idx_want_qrn_ = false;    // attn_q keeps qr_norm in VRAM for the single-token indexer
   uint32_t b_norm_rows_ = 0;            // n_embd, remembered by hc_pre for the lazy norm fetch
@@ -496,7 +549,7 @@ private:
                        uint32_t n_keys, uint32_t n_mask, uint32_t topk, uint32_t pos,
                        uint32_t n_rot, RopeDerived rope);
   // Tells attn_q to keep qr_norm in VRAM for indexer_one instead of copying it to the host.
-  void     set_idx_want_qrn(bool v) { idx_want_qrn_ = v; a_idx_layer_ = -1; }
+  void     set_idx_want_qrn(bool v) { idx_want_qrn_ = v; a_idx_layer_[slot_] = -1; b_idx_layer_[slot_] = -1; }
   // Scores every compressed row against every head, ReLU-weights them and takes the top `topk`,
   // leaving the admission mask on device where batch_attend already reads it. Must be followed by
   // batch_attend for the same tokens.

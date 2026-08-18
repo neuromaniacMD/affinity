@@ -1945,6 +1945,12 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
                    dspark_emb_.data() + (size_t)b * E);
   }
   bf16_dequant(embed_ + (size_t)first_id * E, E, dspark_emb_.data());
+  if (const char* e = std::getenv("AFF_SLOT_DEBUG")) { (void)e;
+    uint64_t v = 1469598103934665603ull;
+    for (size_t i = 0; i < (size_t)E; ++i) { uint32_t bits; std::memcpy(&bits, &dspark_emb_[i], 4); v ^= bits; v *= 1099511628211ull; }
+    aff::ui::err("slot-hash dspark_emb row0 first_id=%u P=%u hash=%016llx\n",
+                 first_id, P, (unsigned long long)v);
+  }
   if (!bops_.begin(bops_.ctx, B, P, dspark_emb_.data(), E, HC)) return false;
   AFF_PH(draft_seed);
 

@@ -1,5 +1,7 @@
 // affinity — CLI entry point: serve an OpenAI-compatible endpoint from a .aff model.
 #include "build_stamp.h"
+#include <mutex>
+
 #include "engine/model.h"
 #include "engine/instrument.h"
 #include "engine/route_trace.h"
@@ -280,6 +282,9 @@ int main(int argc, char** argv) {
   // Positions the KV cache is sized for. 1M is the model's maximum and the default, and since the
   // cache became lazily backed it is very nearly free: --kv-size reserves address space, and only
   // --kv-commit below spends VRAM. Lowering it no longer buys residency.
+  // Independent sequences the engine holds device state for. 1 is the historical engine.
+  // --kv-size is PER SLOT, so N slots cost N times the KV: the budget is total positions.
+  uint32_t kSlots = 1;
   uint64_t kMaxKvPositions = 1048576;
   // Positions the compressed cache is BACKED with at load. The rest of --kv-size is reserved
   // address space that costs no VRAM until the sequence reaches it, and the difference goes to the
@@ -418,6 +423,7 @@ int main(int argc, char** argv) {
     else if (a == "--gpu-headroom-mib") gpu_headroom_mib = std::strtod(nxt(), nullptr);
     else if (a == "--keepalive-us") keepalive_us = std::strtod(nxt(), nullptr);
     else if (a == "--gpus") kGpuCount = (size_t)std::strtoull(nxt(), nullptr, 10);
+    else if (a == "--slots") kSlots = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--kv-size") kMaxKvPositions = std::strtoull(nxt(), nullptr, 10);
     else if (a == "--kv-commit") kKvCommitPositions = std::strtoull(nxt(), nullptr, 10);
     else if (a == "--kv-margin") kKvMarginPositions = std::strtoull(nxt(), nullptr, 10);
@@ -505,6 +511,12 @@ int main(int argc, char** argv) {
         "      --kv-size N             KV cache positions (default 1048576, the model's maximum).\n"
         "                              Address space, not VRAM — the cache is backed lazily, so\n"
         "                              lowering this does not buy residency. --kv-commit does.\n"
+        "      --slots N               independent sequences to hold device state for (default 1).\n"
+        "                              --kv-size is PER SLOT, so N slots cost N times the KV and\n"
+        "                              the budget is TOTAL positions: 4 slots of 128K costs what\n"
+        "                              one slot of 512K does. Above 1 requires --kv-commit ==\n"
+        "                              --kv-size (a slot is fully backed; the grower is per-\n"
+        "                              sequence and does not run).\n"
         "      --kv-commit N           positions BACKED with VRAM at load (default 65536). The\n"
         "                              rest of --kv-size costs no VRAM until the sequence reaches\n"
         "                              it, and the difference goes to the expert slab: 621 more\n"
@@ -873,6 +885,32 @@ int main(int argc, char** argv) {
       aff::ui::out("hidden state: on host (%s)\n", herr.c_str());
     // FP8R is the only layout the flash attention kernel reads; the enum's other arms exist for
     // aff-verify's reference paths, not for a runtime choice.
+    if (kSlots > 1) {
+      if (kKvCommitPositions != kMaxKvPositions) {
+        aff::ui::fatal("--slots %u needs --kv-commit == --kv-size (%llu != %llu): a slot is backed "
+                       "in full at load, because the KV grower tracks one sequence.\n",
+                       kSlots, (unsigned long long)kKvCommitPositions,
+                       (unsigned long long)kMaxKvPositions);
+        return 1;
+      }
+      if (!dense_gpu.set_n_slots(kSlots)) {
+        aff::ui::fatal("--slots %u out of range (1..16)\n", kSlots);
+        return 1;
+      }
+      aff::ui::out("slots: %u sequences, %llu positions each (%llu total)\n", kSlots,
+                   (unsigned long long)kMaxKvPositions,
+                   (unsigned long long)kMaxKvPositions * kSlots);
+    }
+    // The prefix cache holds single-sequence design (a shared writer thread, stage pool and index)
+    // and poisons draft acceptance for one slot under two interleaved sequences — a concurrency bug
+    // isolated but not yet fixed (repro: SLOTS-STAGE3 findings). Correct behaviour beats a fast
+    // wrong one, so multi-slot serving runs WITHOUT it. Single-slot is unaffected and keeps it.
+    if (kSlots > 1 && !pcache.dir.empty()) {
+      aff::ui::err("prefix cache: disabled under --slots %u (single-sequence design; multi-slot "
+                   "poisons draft acceptance — see SLOTS-STAGE3). Single-slot keeps it.\n", kSlots);
+      pcache.dir.clear();
+      pcache_verify = false;
+    }
     if (dense_gpu.attn_init(c.n_layer + n_stage, c.n_head, c.head_dim, c.rope_dim, c.sliding,
                             comp_rows.data(), KvDtype::FP8R, kMaxKvPositions, kKvCommitPositions,
                             &kerr))
@@ -1652,8 +1690,16 @@ int main(int argc, char** argv) {
   // greedy decode by construction, so this is exactly temperature 0 — the caller is told rather
   // than quietly given something else.
   //
+  // ---- the engine step lock ---------------------------------------------------------------------
+  //
+  // Sequence state is per SLOT since --slots, but the per-step scratch is not: one set of staging
+  // buffers, one prefill arena, one indexer score plane. So requests may be in flight together and
+  // their STEPS may not overlap. This is held across one step — a prefill chunk, or one speculative
+  // block — and released around anything that waits on the network, so a slow reader cannot stall
+  // the cards.
+  std::mutex engine_mu;
   // `emit` takes each accepted token and returns false to stop. Returns how many were emitted.
-  auto spec_decode = [&](SeqState& st, const Model::BlockOut& seed_blk, uint32_t first,
+  auto spec_decode = [&](uint32_t slot, SeqState& st, const Model::BlockOut& seed_blk, uint32_t first,
                          std::vector<uint32_t>& hist, uint32_t max_new, bool ignore_eos_,
                          const std::function<bool(uint32_t)>& emit,
                          const SamplerConfig* sc = nullptr,
@@ -1679,10 +1725,38 @@ int main(int argc, char** argv) {
       vb.top_k = sc->top_k;
       vb.min_p = sc->min_p;
     }
+    const bool slot_dbg = std::getenv("AFF_SLOT_DEBUG") != nullptr;
+    const bool n_slots_gt1 = dense_gpu.n_slots() > 1;
+    uint64_t tap_hash_prev = 0, kv_hash_prev = 0;
+    const uint32_t dbg_layer = dense_gpu.kv_layers_debug() ? dense_gpu.kv_layers_debug() - 1u : 0u;
+    uint32_t my_blocks = 0, my_accepted = 0;   // LOCAL, not model.profile(): uncontaminated
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
     uint32_t next = first, generated = 0;
     bool stop = false;
     while (generated < max_new && !stop) {
+      // ONE BLOCK is one step. Taken here and dropped right after `rollback`, which is the last
+      // thing in the iteration that touches the device: everything below it is host bookkeeping and
+      // the emit callback, and emit writes to a socket.
+      std::unique_lock<std::mutex> step(engine_mu);
+      if (!dense_gpu.set_slot(slot)) {
+        aff::ui::fatal("fatal: slot %u out of range\n", slot);
+        std::abort();
+      }
+      if (slot_dbg && draft_on && seed_n) {
+        const uint64_t now = dense_gpu.tap_hash_debug();
+        if (tap_hash_prev && now != tap_hash_prev)
+          aff::ui::err("slot %u: TAP CHANGED between blocks (%016llx -> %016llx)\n", slot,
+                       (unsigned long long)tap_hash_prev, (unsigned long long)now);
+        else if (tap_hash_prev)
+          aff::ui::err("slot %u: tap intact across the gap (%016llx)\n", slot,
+                       (unsigned long long)now);
+        const uint64_t kvnow = dense_gpu.kv_hash_debug(dbg_layer);
+        if (kv_hash_prev && kvnow != kv_hash_prev)
+          aff::ui::err("slot %u: DRAFT KV CHANGED between blocks (%016llx -> %016llx)\n", slot,
+                       (unsigned long long)kv_hash_prev, (unsigned long long)kvnow);
+        else if (kv_hash_prev)
+          aff::ui::err("slot %u: draft kv intact\n", slot);
+      }
       if (draft_on && seed_n && !model.dspark_seed(seed_n, seed_pos0)) {
         aff::ui::fatal("fatal: dspark_seed refused %u positions at %u\n", seed_n, seed_pos0);
         std::abort();
@@ -1698,6 +1772,11 @@ int main(int argc, char** argv) {
         nd = B;
       }
       const uint32_t P = st.pos;
+      if (slot_dbg && nd) {
+        std::string ds;
+        for (uint32_t i = 0; i < nd; ++i) ds += std::to_string(draft[i]) + (i + 1 < nd ? "," : "");
+        aff::ui::err("slot %u DRAFT P=%u next=%u -> [%s]\n", slot, P, next, ds.c_str());
+      }
       fed[0] = next;
       for (uint32_t i = 0; i < nd; ++i) fed[1 + i] = draft[i];
       // The proposals the target is asked to price, and the uniforms its draws use. Position j is
@@ -1745,9 +1824,20 @@ int main(int argc, char** argv) {
         if (k < nd) { rejected = true; reject_tok = vb.draws[k].tok_excl; }
         for (uint32_t j = 0; j < nd; ++j) match[j] = accept_u[j] < (double)vb.draws[j].p_query;
       }
+      if (slot_dbg && nd) {
+        std::string gs;
+        for (uint32_t i = 0; i < nd; ++i)
+          gs += std::to_string(!sc ? vb.greedy[i] : vb.draws[i].tok) + (i + 1 < nd ? "," : "");
+        aff::ui::err("slot %u VERIFY P=%u k=%u target=[%s]\n", slot, P, k, gs.c_str());
+      }
+      my_blocks++; my_accepted += k;
       model.note_block(nd, k, match.data());
       // Positions P..P+k are real; P+k+1 holds vb.greedy[k] and is fed by the next block.
       model.rollback(&st, P + k + 1);
+      if (n_slots_gt1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
+      if (slot_dbg) { tap_hash_prev = dense_gpu.tap_hash_debug();
+                      kv_hash_prev = dense_gpu.kv_hash_debug(dbg_layer); }
+      step.unlock();                    // the cards are free from here; the rest is host-side
       seed_n = vb.tap_rows ? k + 1 : 0u;
       seed_pos0 = P;
       // The token at position k: the target's own, from whichever rule applied above.
@@ -1805,6 +1895,9 @@ int main(int argc, char** argv) {
       // placement report are the result of the run and all of them still get printed.
       if (dash.quit_requested()) stop = true;
     }
+    if (std::getenv("AFF_SLOT_DEBUG"))
+      aff::ui::err("LOCAL slot %u: %u blocks, %u accepted (%.2f tok/blk), %u generated\n", slot, my_blocks,
+                   my_accepted, my_blocks ? (double)generated / my_blocks : 0.0, generated);
     return generated;
   };
 
@@ -2007,7 +2100,7 @@ int main(int argc, char** argv) {
     }
     dash.stage(aff::ui::Stage::Decode);
     run_view = {ids.size() ? ids.size() - 1 : 0, (uint64_t)n_predict, hist.size(), pre_rate, t1};
-    generated += (int)spec_decode(st, blk, next, hist, (uint32_t)n_predict, ignore_eos,
+    generated += (int)spec_decode(/*slot=*/0u, st, blk, next, hist, (uint32_t)n_predict, ignore_eos,
                                     [&](uint32_t id) {
         aff::ui::tok(tok.vocab_size() ? tok.decode_one(id) : std::to_string(id) + " ");
         return true;
@@ -2100,8 +2193,9 @@ int main(int argc, char** argv) {
   // Defaults are the model card's: temperature 1.0, top_p 0.95 (its agentic recommendation, and this
   // server exists to be driven by agents), and a random seed per request so two identical requests
   // are two samples rather than one answer twice.
+  srv.set_slots(kSlots);
   const bool ok = srv.start(host, port, [&](const CompletionRequest& req, const TokenSink& sink,
-                                            GenResult* res) {
+                                            GenResult* res, uint32_t slot) {
     std::vector<ChatMsg> msgs;
     if (req.messages.empty()) {
       // The legacy completions endpoint: a raw prompt with no roles, so it is encoded as a bare
@@ -2228,11 +2322,19 @@ int main(int argc, char** argv) {
     uint32_t matched_blocks = 0;              // read again below, by the promotion boundary
     if (prefix_cache.ready() && n_pre) {
       uint32_t& matched = matched_blocks;
-      const uint32_t hit = prefix_cache.lookup(ids.data(), n_pre, &matched);
       std::string rerr;
-      if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
-        model.restore_state(&st, hit);
-        from = hit;
+      uint32_t hit = 0;
+      {
+        // lookup reads the cache index and restore writes this slot's KV; both must be serialized
+        // against the other slot's publish, which mutates the same index and stage pool. lookup
+        // was previously outside the lock, racing publish's hash-table writes.
+        std::unique_lock<std::mutex> step(engine_mu);
+        dense_gpu.set_slot(slot);
+        hit = prefix_cache.lookup(ids.data(), n_pre, &matched);   // index only, no I/O
+        if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
+          model.restore_state(&st, hit);
+          from = hit;
+        }
       }
       // One line a request. What a prefix cache does is invisible from the outside — a miss and a
       // hit differ only in how long the reply took — so the hit length is reported rather than left
@@ -2278,10 +2380,13 @@ int main(int argc, char** argv) {
       if (b > from && b + c.sliding <= n_pre) promote = (uint32_t)b;
     }
     if (promote) {
+      std::unique_lock<std::mutex> step(engine_mu);
+      dense_gpu.set_slot(slot);
       kv_reserve_for(st.pos + (uint64_t)ids.size() + 2);
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, promote - from, &st, nullptr,
                                                 nullptr, nullptr, true, &blk);
+      if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       watch_prefill(false);
       if (!pre_ok) {
         res->finish_reason = "stop";
@@ -2297,10 +2402,13 @@ int main(int argc, char** argv) {
       from = promote;
     }
     if (n_pre > from) {
+      std::unique_lock<std::mutex> step(engine_mu);
+      dense_gpu.set_slot(slot);
       kv_reserve_for(st.pos + (uint64_t)ids.size() + 2);
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
                                                 nullptr, &logits, true, &blk);
+      if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       watch_prefill(false);
       if (!pre_ok) {
         res->finish_reason = "stop";
@@ -2434,7 +2542,12 @@ int main(int argc, char** argv) {
 
 
     run_view = {ids.size(), total_budget, hist.size(), 0.0, std::chrono::steady_clock::now()};
-    const uint32_t made = spec_decode(st, blk, ids.empty() ? 1u : ids.back(), hist, total_budget,
+    // Per-request speculation accounting. The counters are global and cumulative, so a snapshot
+    // either side of the call is this request's share — which is the only way to see acceptance
+    // collapse for ONE sequence while another is interleaved with it.
+    const Model::PhaseProfile p_before = model.profile();
+    const auto t_dec0 = std::chrono::steady_clock::now();
+    const uint32_t made = spec_decode(slot, st, blk, ids.empty() ? 1u : ids.back(), hist, total_budget,
                                       /*ignore_eos_=*/false, [&](uint32_t id) {
       if ((int32_t)id == tok.eos()) return false;
       raw += tok.vocab_size() ? tok.decode_one(id) : std::string();
@@ -2515,6 +2628,19 @@ int main(int argc, char** argv) {
     }
     // Truncation has to be distinguishable from a finished answer: a caller that sees "stop" on a
     // reply cut at max_tokens has no way to know it was cut, and will hand the fragment on as whole.
+    {
+      const Model::PhaseProfile& pa = model.profile();
+      const uint64_t nb = pa.blocks - p_before.blocks;
+      const uint64_t nd = pa.drafted - p_before.drafted;
+      const uint64_t na = pa.accepted - p_before.accepted;
+      const double el =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t_dec0).count();
+      aff::ui::err("slot %u: %u tok in %.2fs (%.1f t/s), %llu blocks, %llu drafted, %llu accepted "
+                   "(%.1f%%, %.2f tok/block)\n", slot, made, el, el > 0 ? made / el : 0.0,
+                   (unsigned long long)nb, (unsigned long long)nd, (unsigned long long)na,
+                   nd ? 100.0 * (double)na / (double)nd : 0.0,
+                   nb ? (double)made / (double)nb : 0.0);
+    }
     // The budget is spent inside spec_decode rather than in the sink below it, so the only thing
     // that says which way the run ended is whether it produced the whole allowance -- EOS and every
     // stop string return early and leave `made` short.

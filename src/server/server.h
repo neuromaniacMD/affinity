@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -87,13 +88,21 @@ using TokenSink = std::function<bool(const std::string& piece, Delta chan, bool 
 // Supplied by the engine; the server owns no model state.
 // The sink streams text as it appears; the result carries what the markup meant, which is only
 // known once the turn is complete. A tool call is not text and cannot be streamed as content.
-using GenerateFn = std::function<void(const CompletionRequest&, const TokenSink&, GenResult*)>;
+// `slot` is the sequence slot the engine must run this request in: the generator owns one set of
+// per-sequence device state per slot, so two requests in different slots can interleave their
+// STEPS without touching each other's KV. Always < the value passed to set_slots().
+using GenerateFn =
+    std::function<void(const CompletionRequest&, const TokenSink&, GenResult*, uint32_t slot)>;
 
 class Server {
 public:
   bool start(const std::string& host, uint16_t port, GenerateFn gen, std::string* err);
   void stop();
   void set_model_name(const std::string& n) { model_name_ = n; }
+  // How many requests may be in flight. One slot is the historical behaviour: strict one at a
+  // time. Must match the engine's --slots, because it is an index into the engine's per-sequence
+  // state and not just a count.
+  void set_slots(uint32_t n) { n_slots_ = n ? n : 1; }
   uint16_t port() const { return port_; }
 
 private:
@@ -101,10 +110,22 @@ private:
   int listen_fd_ = -1;
   uint16_t port_ = 0;
   std::string model_name_ = "DeepSeek-V4-Flash";
-  // The generator closes over one engine: one KV cache, one set of scratch buffers. Threads are per
-  // connection, so without this two requests interleave inside that state and both come out fluent
-  // and wrong. Serving is one request at a time by construction; the rest queue here.
-  std::mutex gen_mu_;
+  // ---- admission ------------------------------------------------------------------------------
+  //
+  // The generator closes over one engine. Its KV cache is now per SLOT, so two requests in
+  // different slots can be in flight at once; what they still share is the per-step scratch, and
+  // the generator serializes individual steps on its own lock. This pool is therefore admission
+  // control, not mutual exclusion: it hands out slots and blocks when they are all taken, which is
+  // what stops a third request from having nowhere to put its KV.
+  //
+  // With n_slots_ == 1 this degenerates to exactly the old behaviour — one request at a time, the
+  // rest queue here.
+  uint32_t acquire_slot();
+  void release_slot(uint32_t s);
+  std::mutex slot_mu_;
+  std::condition_variable slot_cv_;
+  uint64_t slot_busy_ = 0;              // bit s set == slot s is taken
+  uint32_t n_slots_ = 1;
   GenerateFn gen_;
   std::atomic<bool> running_{false};
 };
