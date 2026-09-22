@@ -281,7 +281,7 @@ void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float
 void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float* scale,
                               const float* base, const float* nw, float* cur, float* norm,
                               float* norm_tm, float* part, uint32_t n_embd, uint32_t n_hc,
-                              uint32_t nb, float hc_eps, float rms_eps, void* stream);
+                              uint32_t nb, float hc_eps, float rms_eps, void* stream, const float* pre_in);
 
 // out_hc[dst][d][b] = block[d][b]*post[dst][b] + sum_src comb[dst + src*n_hc][b] * hc[src][d][b]
 //

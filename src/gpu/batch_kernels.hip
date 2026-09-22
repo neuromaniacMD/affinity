@@ -1773,20 +1773,29 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_head_gate_kernel(
     const uint16_t* __restrict__ hc, const float* __restrict__ part_in,
     const float* __restrict__ mix, const float* __restrict__ scale,
     const float* __restrict__ base, float* __restrict__ cur, float* __restrict__ part,
-    uint32_t n_embd, uint64_t hc_dim, float hc_eps, float rms_eps) {
+    uint32_t n_embd, uint64_t hc_dim, float hc_eps, float rms_eps,
+    const float* __restrict__ pre_in) {
   __shared__ float s[NB * kHcnThreads];
   __shared__ float s_pre[NB * NH];
   const uint32_t tid = threadIdx.x;
   // The gates in every block rather than in a launch of their own, for the reason on the kernel
   // above: NH sigmoids in NB threads is latency whatever runs it, and a launch here is ~2 us.
   if (tid < NB) {
-    float tot = 0.0f;
-    for (uint32_t c = 0; c < kHcnChunks; ++c) tot += part_in[(size_t)c * NB + tid];
-    const float mix_scale = rsqrtf(tot / (float)hc_dim + rms_eps);
+    // V4.1's head has no mixer of its own: `pre_in` is the mix the last layer's FFN already
+    // produced, so the gates are read rather than recomputed and `mix`/`scale`/`base`/`part_in`
+    // are not touched at all.
+    if (pre_in) {
 #pragma unroll
-    for (uint32_t h = 0; h < NH; ++h) {
-      const float z = mix[(size_t)h * NB + tid] * mix_scale * scale[0] + base[h];
-      s_pre[h * NB + tid] = 1.0f / (1.0f + __expf(-z)) + hc_eps;
+      for (uint32_t h = 0; h < NH; ++h) s_pre[h * NB + tid] = pre_in[(size_t)h * NB + tid];
+    } else {
+      float tot = 0.0f;
+      for (uint32_t c = 0; c < kHcnChunks; ++c) tot += part_in[(size_t)c * NB + tid];
+      const float mix_scale = rsqrtf(tot / (float)hc_dim + rms_eps);
+#pragma unroll
+      for (uint32_t h = 0; h < NH; ++h) {
+        const float z = mix[(size_t)h * NB + tid] * mix_scale * scale[0] + base[h];
+        s_pre[h * NB + tid] = 1.0f / (1.0f + __expf(-z)) + hc_eps;
+      }
     }
   }
   __syncthreads();
@@ -2884,7 +2893,7 @@ void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float
 void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float* scale,
                               const float* base, const float* nw, float* cur, float* norm,
                               float* norm_tm, float* part, uint32_t n_embd, uint32_t n_hc,
-                              uint32_t nb, float hc_eps, float rms_eps, void* stream) {
+                              uint32_t nb, float hc_eps, float rms_eps, void* stream, const float* pre_in) {
   if (nb != kNarrowTok || !part) {
     aff::ui::fatal("batch_hc_head_narrow: nb=%u is not the %u-column arena\n", nb,
                  kNarrowTok);
@@ -2897,7 +2906,7 @@ void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float*
   AFF_BLAUNCH((hcn_sq_kernel<NB>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc);
 #define AFF_HCH_X(NH)                                                                             \
   AFF_BLAUNCH((hcn_head_gate_kernel<NB, NH>), g, t, 0, st, hc, part, mix, scale, base, cur, part2, \
-              n_embd, (uint64_t)n_embd * n_hc, hc_eps, rms_eps)
+              n_embd, (uint64_t)n_embd * n_hc, hc_eps, rms_eps, pre_in)
   if (n_hc == 1)      { AFF_HCH_X(1); }
   else if (n_hc == 2) { AFF_HCH_X(2); }
   else if (n_hc == 4) { AFF_HCH_X(4); }

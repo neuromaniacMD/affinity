@@ -197,6 +197,8 @@ struct LayerWeights {
 
   RopeParams rope;                        // resolved once at load: theta and YaRN per layer
   uint32_t   ratio = 0;
+  // Whose compressed cache this layer reads: itself on V4, the nearest kv-source on V4.1.
+  uint32_t   kv_owner = 0;
 };
 
 // Per-layer rolling state for one sequence — COUNTS ONLY. Every key this names lives in VRAM: the
@@ -421,6 +423,10 @@ public:
     // `indexer_one` leaves the admission mask on device, so `attend` is then called with a null
     // `allowed` and picks it up there.
     bool (*compress_one)(void* ctx, const CompressArgs& a) = nullptr;
+    // Which layer's compressed cache each layer READS (V4.1 shares one per kv-source group; V4
+    // gives every compressing layer its own, and then this is the identity). Handed over once, at
+    // load: the raw sliding window stays per layer, so only the compressed half is redirected.
+    void (*set_kv_owner)(void* ctx, const uint32_t* owner, uint32_t n) = nullptr;
     // `n_keys` is what the indexer SCORES and `n_mask` what the attention will READ — the two
     // compressors have separate capacities, so the second can be the larger and the rows between
     // them must come back "not admitted" rather than stale.
@@ -584,6 +590,10 @@ public:
     // epilogue they transcribe is the same one.
     bool (*collapse)(void* ctx, int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,
                      uint32_t n_hc, float hc_eps, float rms_eps) = nullptr;
+    // V4.1: its head has no mixer, so the epilogue reuses the mix the last layer's FFN left on the
+    // device rather than computing one from `fn` — same kernel, same order, one input fewer.
+    bool (*collapse_pre)(void* ctx, int32_t nw, uint32_t n_embd, uint32_t n_hc, float hc_eps,
+                         float rms_eps) = nullptr;
     // The lanes AVERAGED — `h.mean(dim=2)`, which is what DSpark conditions its draft on — written
     // into the card's own tap plane rather than handed back. Nothing crosses the bus in either
     // direction: draft_proj reads the same plane on the same card. `slot` is which of the tap
@@ -906,6 +916,8 @@ private:
   // The draft block's seed embeddings, sized once on the first block and then only row 0 rewritten.
   // See dspark_draft: rows 1..B-1 are the noise token in every block there will ever be.
   mutable std::vector<float> dspark_emb_;
+  // layer -> the layer whose compressed KV it reads; see LayerWeights::kv_owner.
+  std::vector<uint32_t> kv_owner_;
   DenseW hc_head_fn_;
   const float* hc_head_base_ = nullptr;
   const float* hc_head_scale_ = nullptr;

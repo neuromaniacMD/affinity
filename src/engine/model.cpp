@@ -496,6 +496,29 @@ bool Model::load(const std::string& aff_path, std::string* err) {
       }
     }
   }
+
+  // ---- who owns each layer's compressed KV ------------------------------------------------------
+  //
+  // V4.1: the nearest kv-source at or before the layer. The reference calls this sharing a cache
+  // "with the layers that share its ratio", and the source is always the first of its run, so
+  // nearest-preceding and first-of-run are the same layer. V4: every layer owns its own, and the
+  // map is the identity, so the device path is unchanged for it.
+  kv_owner_.resize(cfg_.n_layer);
+  for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
+    uint32_t owner = l;
+    if (cfg_.v41 && cfg_.ratio_for(l) && !cfg_.is_kv_source(l)) {
+      owner = UINT32_MAX;
+      for (uint32_t k = l + 1; k-- > 0;)
+        if (cfg_.is_kv_source(k) && cfg_.ratio_for(k) == cfg_.ratio_for(l)) { owner = k; break; }
+      if (owner == UINT32_MAX) {
+        if (err) *err = "layer " + std::to_string(l) + " compresses but no kv-source precedes it";
+        return false;
+      }
+    }
+    kv_owner_[l] = owner;
+    layers_[l].kv_owner = owner;
+  }
+  if (dops_.set_kv_owner) dops_.set_kv_owner(dops_.ctx, kv_owner_.data(), (uint32_t)kv_owner_.size());
   return true;
 }
 
@@ -900,7 +923,7 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     // `comp_wgate` is not required: V4.1's ratio-1 layers pool a single position and ship no gate,
     // and the device compressor takes h_sc = -1 for that (DenseW leaves .gpu at -1 when unbound).
     const bool dev_comp = dops_.compress_one && dops_.indexer_one && w.ratio && w.comp_wkv &&
-                          (w.comp_wgate || cfg_.v41) && dev_hc;
+                          (w.comp_wgate || cfg_.v41) && dev_hc && cfg_.is_kv_source(l);
     const bool dev_index = dev_comp && has_idx && want_qrnorm && st.n_comp;
     if (dops_.want_qrn_dev) dops_.want_qrn_dev(dops_.ctx, dev_index);
 
@@ -1031,6 +1054,12 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
       }
       st.n_comp += n_out;
       if (has_idx) st.n_idx_comp += n_out;
+      // The layers reading this cache must see the same row count: they do not compress, so their
+      // own counter would stay at zero and attention would ignore every compressed row.
+      for (uint32_t c = l + 1; c < cfg_.n_layer && kv_owner_[c] == l; ++c) {
+        s->layer[c].n_comp = st.n_comp;
+        s->layer[c].n_idx_comp = st.n_idx_comp;
+      }
     }
 
     AFF_PH(compressor);
@@ -1477,7 +1506,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // per-token prefix of it that attention needs. The ratio-128 HCA layers go the same way; they
       // simply have no indexer half, so their pool is one window instead of two.
       const bool has_idx = w.ratio == 4 && w.idx_comp_wkv && w.idx_comp_wgate;
-      const bool dev_comp = bops_.compress && w.ratio && w.comp_wkv && (w.comp_wgate || cfg_.v41);
+      const bool dev_comp = bops_.compress && w.ratio && w.comp_wkv && (w.comp_wgate || cfg_.v41) &&
+                            cfg_.is_kv_source(l);
       uint32_t n_out = 0;
       if (w.ratio) {
         const uint64_t cap = st.comp_rows;
@@ -1500,7 +1530,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         ca.iscale = 1.0f / std::sqrt((float)(IHD * INH));
         ca.eps = cfg_.rms_eps;
         if (!bops_.compress(bops_.ctx, ca)) return false;
-      } else if (w.ratio) {
+      } else if (w.ratio && cfg_.is_kv_source(l)) {
         aff::ui::fatal("fatal: layer %u has a compressor and the device cannot run it\n", l);
         std::abort();
       }
@@ -1537,6 +1567,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       bool idx_run = false;
       uint32_t idx_keys = 0;
       const uint32_t n_comp_end = st.n_comp + n_out;   // what the device just emitted, in total
+      const bool shares_kv = w.ratio && w.kv_owner != l;
       for (uint32_t b = 0; b < live; ++b) {
         const uint32_t pos = pos0 + b;
         {                                            // the host's own copy of the sliding window
@@ -1550,6 +1581,13 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
             ++st.n_comp;
             if (has_idx) ++st.n_idx_comp;
           }
+        } else if (shares_kv && (pos + 1) % w.ratio == 0 &&
+                   st.n_comp < s->layer[w.kv_owner].n_comp) {
+          // A layer that READS another's cache still needs its own per-token prefix: the rows exist
+          // (the source emitted them earlier in this same chunk, so its total is already final),
+          // but this layer never ran a compressor to count them. Same growth rule, bounded by what
+          // the owner actually holds.
+          ++st.n_comp;
         }
 
         ncompb[b] = st.n_comp;
@@ -1862,14 +1900,19 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // absorbs it — but that is a property of the input, not a guarantee, and a change to what
       // feeds this has to be re-checked against the host path rather than assumed.
       if (cfg_.v41) {
-        // The card's epilogue computes the head mix from hc_head_fn, which V4.1 does not have: its
-        // head reuses the last layer's FFN mix, and that vector never leaves the device today.
-        // Refusing beats collapsing with a mix belonging to no sublayer.
-        aff::ui::fatal("fatal: the block head epilogue is not ported to v4.1 (its head has no "
-                       "mixer; it reuses the last layer's FFN mix, which the device path does not "
-                       "hand back yet)\n");
-        std::abort();
-      }
+        // V4.1's head has no mixer: it collapses with what the last layer's FFN produced, which is
+        // still the device's `b_pre` — nothing between that hc_pre and here writes it.
+        if (!bops_.collapse_pre || out_norm_gpu_ < 0) {
+          aff::ui::fatal("fatal: the v4.1 head epilogue needs collapse_pre and the output norm on "
+                         "the card (norm handle %d)\n", out_norm_gpu_);
+          std::abort();
+        }
+        if (!bops_.collapse_pre(bops_.ctx, out_norm_gpu_, E, HC, cfg_.hc_eps, cfg_.rms_eps)) {
+          ui::err("block head: the v4.1 lane collapse refused\n");
+          return false;
+        }
+        s->hc_host = false;
+      } else {
       if (!bops_.collapse || hc_head_fn_.gpu < 0 || hc_head_scale_gpu_ < 0 ||
           hc_head_base_gpu_ < 0 || out_norm_gpu_ < 0) {
         aff::ui::fatal("fatal: the block head's epilogue runs on the card and one of its four "
@@ -1886,6 +1929,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       }
       // The host lanes are no longer maintained across a block; see SeqState::hc_host.
       s->hc_host = false;
+      }
       // Sampling and the argmax are the same head; only what comes back differs. A caller that
       // asked to sample and reached a build without the hook gets a refusal rather than a silent
       // greedy turn, because those are different models. `nullptr` for the activation: it is

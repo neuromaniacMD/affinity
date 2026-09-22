@@ -443,6 +443,15 @@ private:
   // key cache are all "widest layer a token will meet", not "this layer".
   std::vector<uint32_t> a_comp_rows_;
   uint32_t comp_rows_for(uint32_t l, uint64_t pos) const;
+  // ---- shared compressed KV (DeepSeek-V4.1) ----------------------------------------------------
+  //
+  // V4 gave every compressing layer its own compressed cache. V4.1 names kv-source layers: the
+  // source builds the cache and the layers after it read that same one, so a layer's compressed
+  // rows live under its OWNER. The raw sliding window stays per layer — only the compressed half is
+  // shared — which is why this maps reads rather than renaming the layer everywhere.
+  // Empty means "every layer owns its own", i.e. V4.
+  std::vector<uint32_t> kv_owner_;
+  uint32_t kvl(uint32_t l) const { return l < kv_owner_.size() ? kv_owner_[l] : l; }
   // The context a_comp_rows_ was sized for, and how much of it is backed at load. The gap between
   // them is address space that costs nothing until the sequence reaches it — which is 962 expert
   // slots at the shipped --kv-size, worth 19% of decode. See gpu/vmem.h.
@@ -544,6 +553,9 @@ private:
   // Both of the layer's compressors for a whole chunk: five GEMMs, four transposes, two pooling
   // kernels and two ring updates. See gpu/compressor_gpu.h.
   bool     batch_compress(const Model::CompressArgs& a);
+  // Which layer's compressed cache each layer reads. See kv_owner_ above; the engine computes it
+  // from the config's kv_source_layer_ids and hands it over once, at load.
+  void     set_kv_owner(const uint32_t* owner, uint32_t n);
   bool     compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_t width,
                          uint32_t idx_width);
   bool     compress_reset();
@@ -610,6 +622,8 @@ private:
   bool     draft_attend(uint32_t layer, uint32_t n, uint32_t pos0, uint32_t win_lo, float scale);
   // The block's four lanes collapsed and normed into b_norm, where the vocabulary head reads its
   // activation. Call it, then pass x = nullptr to draft_head.
+  // The V4.1 head epilogue: collapse with the mix already in b_pre. See the definition.
+  bool     collapse_pre(int32_t nw, uint32_t n_embd, uint32_t n_hc, float hc_eps, float rms_eps);
   bool     draft_collapse(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,
                           uint32_t n_hc, float hc_eps, float rms_eps);
   bool     draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
