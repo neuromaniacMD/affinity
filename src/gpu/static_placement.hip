@@ -870,8 +870,17 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     constexpr double kDriverHeadroomFrac = 0.008;
     const uint64_t keep = headroom_mib_ > 0.0 ? (uint64_t)(headroom_mib_ * 1048576.0)
                                               : (uint64_t)((double)totalb * kDriverHeadroomFrac);
-    const uint64_t cap = std::min<uint64_t>(want, freeb > keep ? freeb - keep : 0);
+    // amdnas-fixes honest-reserve: the slab below is allocated as (per_gpu + shadow_slots_) slots + 4096, and the codebook
+    // follows it — all taken AFTER this sizing, out of `keep`. On a 32 GiB card that turned the intended 262 MiB into
+    // 122 MiB, which is inside the band where the runtime silently computes garbage (probe 16). Reserve them here.
+    const uint64_t engine_after = (uint64_t)shadow_slots_ * slot_stride + (uint64_t)cb_.v.size() * 4 + 4096;
+    const uint64_t avail = freeb > keep + engine_after ? freeb - keep - engine_after : 0;
+    const uint64_t cap = std::min<uint64_t>(want, avail);
     per_gpu[i] = cap / slot_stride;
+    aff::ui::err("placement sizing: card %zu free %.0f MiB, reserve %.0f MiB + engine-after %.0f MiB (shadow %u slots, "
+                 "codebook %.1f MiB) -> %llu slots\n", i, (double)freeb / 1048576.0, (double)keep / 1048576.0,
+                 (double)engine_after / 1048576.0, shadow_slots_, (double)cb_.v.size() * 4 / 1048576.0,
+                 (unsigned long long)per_gpu[i]);
     // A shard slot is claimed on EVERY card at once, so the resident count is the smallest card's,
     // not the sum. With one card it is the same statement.
     if (tp_parts_ > 1) total_slots = i ? std::min(total_slots, per_gpu[i]) : per_gpu[i];
