@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cmath>
 #include <thread>
+#include <mutex>
 #include <unistd.h>
 
 namespace aff {
@@ -1013,6 +1014,29 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     std::atomic<size_t> cursor{0};
     const size_t tp2_check = 0;
     std::atomic<size_t> tp2_bad{0}, tp2_seen{0};
+    // The load loop used to (void)-cast every HIP return. That is the exact shape of the failure
+    // that cost this project the most time: with the slab sized to nearly all of the card, the
+    // FIRST thing to fail is not the slab's own hipMalloc but one of these — a reader's stream,
+    // its pinned buffer, or a copy — and a swallowed failure here leaves the slot holding whatever
+    // the allocator had there before. No crash: fluent token soup, wrong expert weights, DSpark
+    // acceptance pinned at 0.0%. So every return is counted, the first message is kept, and any
+    // failure is FATAL after the join. AFF_SLAB_VERIFY=N additionally reads every Nth expert back
+    // off the card and memcmps it against the pinned source it was copied from — that is the
+    // decisive test between "the bytes never arrived" and "the bytes are there but read wrong".
+    std::atomic<size_t> hip_errs{0};
+    std::atomic<size_t> vrf_n{0}, vrf_bad{0};
+    std::mutex err_mu;
+    std::string first_err;
+    auto note = [&](hipError_t e, const char* what, size_t dev, uint64_t slot) {
+      if (e == hipSuccess) return;
+      if (!hip_errs.fetch_add(1)) {
+        std::lock_guard<std::mutex> g(err_mu);
+        first_err = std::string(what) + ": " + hipGetErrorString(e) + " (dev " +
+                    std::to_string(dev) + ", slot " + std::to_string(slot) + ")";
+      }
+    };
+    size_t verify_every = 0;
+    if (const char* v = getenv("AFF_SLAB_VERIFY")) verify_every = (size_t)atoll(v);
     std::vector<std::thread> th;
     for (int t = 0; t < kReaders; ++t) {
       th.emplace_back([&, t] {
@@ -1022,16 +1046,18 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
         std::vector<hipStream_t> st(devs_.size());
         std::vector<uint8_t> scratch;      // one plane's worth, reused; grows once per reader
         for (size_t d = 0; d < devs_.size(); ++d) {
-          (void)hipSetDevice(devs_[d]);
-          (void)hipHostMalloc(&pin[d], I.stride, hipHostMallocDefault);
-          (void)hipStreamCreate(&st[d]);
+          note(hipSetDevice(devs_[d]), "hipSetDevice", d, 0);
+          note(hipHostMalloc(&pin[d], I.stride, hipHostMallocDefault), "hipHostMalloc(pin)", d, 0);
+          note(hipStreamCreate(&st[d]), "hipStreamCreate", d, 0);
         }
+        std::vector<uint8_t> vrf;    // readback target, grown on first use
         // Under TP=2 the pread lands in pin[0] and each card's shard is cut out of it into its own
         // pinned buffer, so the H2D is still a DMA from pinned memory and still one per card.
         std::vector<void*> pin_sh(tp_parts_ > 1 ? devs_.size() : 0, nullptr);
         for (size_t d = 0; d < pin_sh.size(); ++d) {
-          (void)hipSetDevice(devs_[d]);
-          (void)hipHostMalloc(&pin_sh[d], shard_.stride, hipHostMallocDefault);
+          note(hipSetDevice(devs_[d]), "hipSetDevice", d, 0);
+          note(hipHostMalloc(&pin_sh[d], shard_.stride, hipHostMallocDefault),
+               "hipHostMalloc(pin_sh)", d, 0);
         }
         for (;;) {
           const size_t j = cursor.fetch_add(1);
@@ -1065,18 +1091,32 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
                     (const uint8_t*)pin_sh[p]);
                 if (bad) tp2_bad.fetch_add(bad);
               }
-              (void)hipSetDevice(devs_[p]);
-              (void)hipMemcpyAsync(I.slab[p] + slot * shard_.stride, pin_sh[p], shard_.stride,
-                                   hipMemcpyHostToDevice, st[p]);
-              (void)hipStreamSynchronize(st[p]);
+              note(hipSetDevice(devs_[p]), "hipSetDevice", p, slot);
+              note(hipMemcpyAsync(I.slab[p] + slot * shard_.stride, pin_sh[p], shard_.stride,
+                                  hipMemcpyHostToDevice, st[p]), "hipMemcpyAsync(shard)", p, slot);
+              note(hipStreamSynchronize(st[p]), "hipStreamSynchronize(shard)", p, slot);
+              if (verify_every && j % verify_every == 0) {
+                if (vrf.size() < shard_.stride) vrf.resize(shard_.stride);
+                note(hipMemcpy(vrf.data(), I.slab[p] + slot * shard_.stride, shard_.stride,
+                               hipMemcpyDeviceToHost), "hipMemcpy(verify)", p, slot);
+                vrf_n.fetch_add(1);
+                if (memcmp(vrf.data(), pin_sh[p], shard_.stride)) vrf_bad.fetch_add(1);
+              }
             }
             device_of_[idx] = 0;                    // resident; "which card" no longer applies
             offset_of_[idx] = slot * shard_.stride;
           } else {
-            (void)hipSetDevice(devs_[d]);
-            (void)hipMemcpyAsync(I.slab[d] + slot * I.stride, pin[d], I.stride,
-                                 hipMemcpyHostToDevice, st[d]);
-            (void)hipStreamSynchronize(st[d]);
+            note(hipSetDevice(devs_[d]), "hipSetDevice", d, slot);
+            note(hipMemcpyAsync(I.slab[d] + slot * I.stride, pin[d], I.stride,
+                                hipMemcpyHostToDevice, st[d]), "hipMemcpyAsync", d, slot);
+            note(hipStreamSynchronize(st[d]), "hipStreamSynchronize", d, slot);
+            if (verify_every && j % verify_every == 0) {
+              if (vrf.size() < I.stride) vrf.resize(I.stride);
+              note(hipMemcpy(vrf.data(), I.slab[d] + slot * I.stride, I.stride,
+                             hipMemcpyDeviceToHost), "hipMemcpy(verify)", d, slot);
+              vrf_n.fetch_add(1);
+              if (memcmp(vrf.data(), pin[d], I.stride)) vrf_bad.fetch_add(1);
+            }
             device_of_[idx] = (int)d;
             offset_of_[idx] = slot * I.stride;
           }
@@ -1093,6 +1133,18 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
       });
     }
     for (auto& x : th) x.join();
+    if (verify_every)
+      aff::ui::err("slab verify: %zu experts read back, %zu mismatched\n",
+                   vrf_n.load(), vrf_bad.load());
+    if (hip_errs.load() || vrf_bad.load()) {
+      // Refuse to run degraded — the alternative is a server that answers fluently and wrongly.
+      aff::ui::err("fatal: slab load: %zu swallowed HIP failures, %zu verify mismatches — first: "
+                   "%s. The slab is not what the file holds; refusing to serve. Free VRAM was "
+                   "probably exhausted by the slab itself — raise --gpu-headroom-mib.\n",
+                   hip_errs.load(), vrf_bad.load(),
+                   first_err.empty() ? "(verify only)" : first_err.c_str());
+      return false;
+    }
     if (tp2_check)
       aff::ui::err("TP=2 shard check: %llu experts, %llu mismatching spans\n",
                    (unsigned long long)std::min<size_t>(tp2_check, tp2_seen.load()),
