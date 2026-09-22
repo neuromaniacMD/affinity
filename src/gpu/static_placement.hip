@@ -2148,6 +2148,8 @@ void StaticPlacement::engine_tick(uint32_t layer, const uint32_t* sel, size_t to
   }
 }
 
+// amdnas-fixes move-verify counters (file scope; one engine per process)
+static unsigned long long mv_verified_ = 0, mv_bad_ = 0;
 bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* streams) {
   Impl& I = *impl_;
   const size_t R = devs_.size();
@@ -2276,6 +2278,39 @@ void StaticPlacement::engine_retire(void* const* streams) {
       // and whichever side of the write it lands on names bytes that are correct. That argument is
       // about BYTES; WHEN the card reads the word is the separate question the patch below answers.
       if (M.promote) {
+        // ---- amdnas-fixes move-verify (AFF_MOVE_VERIFY=1) ------------------------------------------------
+        // Both copies of the bytes are valid at this instant (comment above), so this is the one moment a
+        // promotion can be checked end to end: read the slab slot back from every card and compare it with the
+        // pool shard it was copied from. A mismatch = wrong bytes IN VRAM (copy landed wrong, or something moved
+        // the buffer underneath us); a match while the process still poisons = a mapping/bookkeeping race.
+        static const bool kMoveVerify = std::getenv("AFF_MOVE_VERIFY") != nullptr;
+        if (kMoveVerify) {
+          const uint64_t ss_v = slot_stride();
+          const uint8_t* src_v = pool_mut_->slot_base(M.pool_slot);
+          static std::vector<uint8_t> rb;
+          if (rb.size() < ss_v) rb.resize(ss_v);
+          for (size_t dv = 0; dv < R && src_v; ++dv) {
+            AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
+            AFF_HIP_CHECK(hipMemcpy(rb.data(), I.slab[dv] + M.slab_slot * ss_v, ss_v, hipMemcpyDeviceToHost));
+            ++mv_verified_;
+            if (std::memcmp(rb.data(), src_v + (size_t)dv * ss_v, ss_v) != 0) {
+              ++mv_bad_;
+              size_t first = 0; while (first < ss_v && rb[first] == src_v[(size_t)dv * ss_v + first]) ++first;
+              aff::ui::err("MOVE-VERIFY MISMATCH #%llu: layer %u expert %u -> slab slot %llu card %zu, first bad byte at %zu of %llu "
+                           "(verified %llu so far)\n", (unsigned long long)mv_bad_, l, e, (unsigned long long)M.slab_slot, dv,
+                           first, (unsigned long long)ss_v, (unsigned long long)mv_verified_);
+            }
+          }
+        }
+        // owner map: no OTHER resident expert may already point at this slot (double allocation = permanent poison)
+        {
+          const uint64_t off_new = M.slab_slot * slot_stride();
+          for (size_t j = 0; j < device_of_.size(); ++j)
+            if (j != M.idx && device_of_[j] >= 0 && offset_of_[j] == off_new)
+              aff::ui::err("MOVE-VERIFY DOUBLE-MAP: slab slot %llu already owned by layer %u expert %u while publishing "
+                           "layer %u expert %u\n", (unsigned long long)M.slab_slot, (unsigned)(j / n_expert_),
+                           (unsigned)(j % n_expert_), l, e);
+        }
         device_of_[M.idx] = 0;                        // sharded: "which card" is not a question
         offset_of_[M.idx] = M.slab_slot * slot_stride();
         pool_mut_->bind(l, e, -1);
@@ -2385,6 +2420,8 @@ void StaticPlacement::snapshot_plane(std::vector<float>* heat, std::vector<uint8
 }
 
 void StaticPlacement::engine_report() const {
+  if (std::getenv("AFF_MOVE_VERIFY"))
+    aff::ui::err("move-verify: %llu promoted shards read back, %llu mismatched\n", mv_verified_, mv_bad_);
   // Before the engine guard: the SSD tier is reachable under every strategy, including static, and
   // a run that touched it is a run whose throughput has an explanation the other counters cannot
   // give. Silence here is the useful case.
@@ -2469,3 +2506,5 @@ void StaticPlacement::engine_report() const {
 
 
 } // namespace aff
+
+// amdnas-fixes move-verify: AFF_MOVE_VERIFY readback + owner-map checks in engine_retire (2026-09-22).
