@@ -227,6 +227,11 @@ struct SeqState {
   // error. So the flag says which path owns the lanes, and forward_token refuses on a state a block
   // last touched.
   bool hc_host = true;
+  // V4.1 only: the mix the LAST layer's FFN produced, which is what the head collapses the lanes
+  // with (V4 computes its own from hc_head_fn). Written by the FFN sublayer of the final layer;
+  // `valid` guards a head that would otherwise collapse with zeros and emit confident nonsense.
+  float last_ffn_pre[8] = {0};
+  bool  last_ffn_pre_valid = false;
 };
 
 // The DSpark draft, loaded from a companion container.

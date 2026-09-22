@@ -59,12 +59,44 @@ layer 0 (window-only), layer 2 (kv+index source, ratio 2) and layer 20 (ratio 1)
 Not yet covered: consumer layers that need a source layer's shared state (run the source first into the same
 process), the Engram layers, and the mtp stages.
 
+## Measured on the box 2026-09-22 (image `local/affinity:v41-head-therock7.14`)
+- ✅ **Container is correct on the cards**: `aff-gpucheck` on the real V4.1 container — expert FFN layer 0
+  rel 2.4e-07, 34 dense matrices worst rel 2.25e-07, "GPU and CPU agree on the real container bytes".
+  It also reports the dense-only decode ceiling: 8.44 GB/token ⇒ ~149 tok/s across 2 cards at 630 GB/s.
+- ✅ **The loader works end to end**: 470 dense tensors (8.49 GiB over 2 ranks), 3,864/15,360 experts
+  resident (45.8 GiB VRAM), host pool populated hugepage-first, SSD tier for the rest.
+- ⛔ **TP=2 is BLOCKED by the shard rule, not by anything V4.1-specific in the engine.**
+  `expert_shard_layout` shards `down` by columns and requires `cols/parts % 512 == 0`. V4: 2048/2 =
+  1024 ✓. **V4.1: 2304/2 = 1152 ✗.** Single card works (`--gpus 1`, `HIP_VISIBLE_DEVICES=0`). Fixing it
+  means relaxing the gemv shard width to multiples of 128 (2304 = 18 x 128), in `expert_kernel.hip`.
+  ⚠️ Until then V4.1 runs on ONE card, so only ~32 GiB of experts are resident and the rest stream.
+- ⛔ **First forward-path stop: the compressor's `ape`.** `dense_gpu.hip:3960` copies `w.comp_ape` for
+  every compressing layer; V4.1 has no `ape` at all, so the copy fails with `invalid argument`.
+  What V4.1's `Compressor` does instead (`model.py:429`):
+  - **ratio 1** — a plain projection: `norm(wkv(x))`, no gate, no pooling, weights stay bf16.
+  - **ratio 2** — fp32: `kv = wkv(x)`, `score = wgate(x)`, pool the group with `softmax` over the
+    group dimension, then `norm`. A trailing partial group is held in state until it completes.
+  No absolute positional term in either case.
+
 ## Suggested order
-1. Loader: read the V4.1 container + config into the engine's model struct (names above), no forward yet.
-2. Block forward for a **window-only** layer (0/1) → match `golden/L0` within tolerance. This exercises hc,
+1. ~~Loader: read the V4.1 container + config into the engine's model struct~~ ✅ done (config, binder,
+   and the head: V4.1 has no `hc_head_*`, so the head collapses with the mix the LAST layer's FFN
+   produced — host path done, the device epilogue refuses rather than using a mix belonging to no
+   sublayer).
+2. Compressor without `ape`, with the ratio-1 and ratio-2 forms above.
+3. Expert shard width 128 (unblocks TP=2 and doubles resident experts).
+4. Block forward for a **window-only** layer (0/1) → match `golden/L0` within tolerance. This exercises hc,
    attention, router, experts and already proves most of the stack.
-3. Compressor/indexer on a kv-source layer (2) → `golden/L2`; then a consumer layer via the shared runtime.
-4. Candidate pre-filter (layer 20 source) → `golden/L20`.
-5. Engram (layers 1, 14) — hash state first, checked against the reference's own hashes.
-6. Whole-model forward, then the gates (KL vs the FP4 teacher on Lucebox's 8,184 tokens, pv_bench v3,
+5. Compressor/indexer on a kv-source layer (2) → `golden/L2`; then a consumer layer via the shared runtime.
+6. Candidate pre-filter (layer 20 source) → `golden/L20`.
+7. Engram (layers 1, 14) — hash state first, checked against the reference's own hashes.
+8. Whole-model forward, then the gates (KL vs the FP4 teacher on Lucebox's 8,184 tokens, pv_bench v3,
    agentic replay).
+
+## ⚠️ Open question for the golden vectors
+The reference shifts the hyper-connection mixes: each sublayer collapses with the mix the PREVIOUS
+sublayer computed (`Block.forward`: attention uses the previous block's `ffn_pre`, the FFN uses this
+block's `attn_pre`, and the head uses the last FFN's). affinity's host path computes `hc_control` from
+this sublayer's own `fn` and reduces with that same `pre` — i.e. unshifted. Either V4's reference
+differs from V4.1's here, or affinity's V4 path has always been a half-step off. `tools/v41/refblock.py`
+can settle it by dumping the per-sublayer mixes; do that before trusting any layer-level comparison.

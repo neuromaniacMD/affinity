@@ -366,10 +366,14 @@ bool Model::load(const std::string& aff_path, std::string* err) {
   hc_head_base_  = b.f32("hc_head_base");
   hc_head_scale_ = b.f32("hc_head_scale");
   {
+    // V4.1 has no head mixer. `Transformer.forward` collapses the lanes with the mix the LAST
+    // layer's FFN produced (`h = layer.hc_pre(h, pre_mix)`) and goes straight to the final norm, so
+    // the three hc_head_* tensors do not exist in the checkpoint and cannot be required here.
     const std::pair<const void*, const char*> req[] = {
       {embed_, "token_embd"}, {head_.data, "output"}, {out_norm_, "output_norm"},
-      {hc_head_fn_.data, "hc_head_fn"}, {hc_head_base_, "hc_head_base"},
-      {hc_head_scale_, "hc_head_scale"},
+      {cfg_.v41 ? (const void*)1 : hc_head_fn_.data, "hc_head_fn"},
+      {cfg_.v41 ? (const void*)1 : hc_head_base_, "hc_head_base"},
+      {cfg_.v41 ? (const void*)1 : hc_head_scale_, "hc_head_scale"},
     };
     for (const auto& [ptr, name] : req)
       if (!ptr) { if (err) *err = std::string("container is missing ") + name; return false; }
@@ -378,9 +382,10 @@ bool Model::load(const std::string& aff_path, std::string* err) {
   // three vectors need handles for the same reason the draft's do: a container mapping reaches a
   // kernel as an unmapped address. `hc_head_fn_` already has one; b.dense registers as it binds.
   if (dops_.reg_vec) {
-    out_norm_gpu_      = dops_.reg_vec(dops_.ctx, out_norm_, cfg_.n_embd);
-    hc_head_base_gpu_  = dops_.reg_vec(dops_.ctx, hc_head_base_, cfg_.hc_mult);
-    hc_head_scale_gpu_ = dops_.reg_vec(dops_.ctx, hc_head_scale_, 1);
+    out_norm_gpu_ = dops_.reg_vec(dops_.ctx, out_norm_, cfg_.n_embd);
+    // Absent on V4.1, where the head has no mixer of its own.
+    if (hc_head_base_)  hc_head_base_gpu_  = dops_.reg_vec(dops_.ctx, hc_head_base_, cfg_.hc_mult);
+    if (hc_head_scale_) hc_head_scale_gpu_ = dops_.reg_vec(dops_.ctx, hc_head_scale_, 1);
   }
 
   // A container may hold fewer layers than the config declares (--layers during bring-up).
@@ -1118,6 +1123,11 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
         hc_control((const uint16_t*)w.hc_ffn_fn.data, w.hc_ffn_scale, w.hc_ffn_base, s->hc.data(), E, HC,
                    cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps, &hcc);
         hc_reduce(s->hc.data(), hcc.pre, E, HC, cur.data());
+        // V4.1's head has no mixer: it collapses with what the last layer's FFN produced here.
+        if (cfg_.v41 && l + 1 == cfg_.n_layer) {
+          std::memcpy(s->last_ffn_pre, hcc.pre, sizeof(s->last_ffn_pre));
+          s->last_ffn_pre_valid = true;
+        }
       } else {
         std::memcpy(cur.data(), s->hc.data(), E * 4);
       }
@@ -1285,7 +1295,16 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
   if (dev_hc) dops_.hc_read(dops_.ctx, s->hc.data(), E, HC);
   // ---- head: collapse the HC lanes, norm, project to the vocabulary --------------------------
   std::vector<float> embd(E);
-  if (hc_head_fn_ && hc_head_scale_ && hc_head_base_) {
+  if (cfg_.v41) {
+    // `Transformer.forward`: h = layer.hc_pre(h, pre_mix) with the mix the last layer's FFN
+    // returned, then the final norm. Nothing recomputes a head mix.
+    if (!s->last_ffn_pre_valid) {
+      aff::ui::fatal("fatal: v4.1 head has no lane mix — the last layer's FFN did not run on the "
+                     "host path. The device epilogue is not ported yet.\n");
+      std::abort();
+    }
+    hc_reduce(s->hc.data(), s->last_ffn_pre, E, HC, embd.data());
+  } else if (hc_head_fn_ && hc_head_scale_ && hc_head_base_) {
     std::vector<float> flat((size_t)HC * E), pre(HC);
     rms_norm_noweight(s->hc.data(), (uint64_t)HC * E, cfg_.rms_eps, flat.data());
     matvec_bf16((const uint16_t*)hc_head_fn_.data, flat.data(), HC, (uint64_t)HC * E, pre.data());
@@ -1840,6 +1859,15 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // before the vocabulary head rather than something 43 layers of routing amplify, so the argmax
       // absorbs it — but that is a property of the input, not a guarantee, and a change to what
       // feeds this has to be re-checked against the host path rather than assumed.
+      if (cfg_.v41) {
+        // The card's epilogue computes the head mix from hc_head_fn, which V4.1 does not have: its
+        // head reuses the last layer's FFN mix, and that vector never leaves the device today.
+        // Refusing beats collapsing with a mix belonging to no sublayer.
+        aff::ui::fatal("fatal: the block head epilogue is not ported to v4.1 (its head has no "
+                       "mixer; it reuses the last layer's FFN mix, which the device path does not "
+                       "hand back yet)\n");
+        std::abort();
+      }
       if (!bops_.collapse || hc_head_fn_.gpu < 0 || hc_head_scale_gpu_ < 0 ||
           hc_head_base_gpu_ < 0 || out_norm_gpu_ < 0) {
         aff::ui::fatal("fatal: the block head's epilogue runs on the card and one of its four "
