@@ -519,6 +519,34 @@ bool Model::load(const std::string& aff_path, std::string* err) {
     layers_[l].kv_owner = owner;
   }
   if (dops_.set_kv_owner) dops_.set_kv_owner(dops_.ctx, kv_owner_.data(), (uint32_t)kv_owner_.size());
+
+  // ---- ...and who owns each layer's top-k -------------------------------------------------------
+  //
+  // One level up, and a DIFFERENT map: V4.1 has eight index sources against four kv sources, so a
+  // layer's keys and its admissions can come from two different layers (24, 28, 32 and 36 all score
+  // layer 20's keys with their own queries). The reference is `Attention._compress_topk_idxs`: an
+  // index source publishes, everyone after it reuses, until the next one publishes.
+  //
+  // The first compressing layer is always an index source — layer 2 is in both lists — so the slot
+  // is written before it is read. Checked rather than assumed: a consumer that found no source
+  // would read a mask belonging to no layer, which attends to a plausible wrong set rather than
+  // failing.
+  idx_owner_.resize(cfg_.n_layer);
+  for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
+    uint32_t owner = l;
+    if (cfg_.v41 && cfg_.ratio_for(l) && !cfg_.is_index_source(l)) {
+      owner = UINT32_MAX;
+      for (uint32_t k = l + 1; k-- > 0;)
+        if (cfg_.is_index_source(k)) { owner = k; break; }
+      if (owner == UINT32_MAX) {
+        if (err) *err = "layer " + std::to_string(l) + " compresses but no index-source precedes it";
+        return false;
+      }
+    }
+    idx_owner_[l] = owner;
+  }
+  if (dops_.set_idx_owner)
+    dops_.set_idx_owner(dops_.ctx, idx_owner_.data(), (uint32_t)idx_owner_.size());
   if (dops_.set_shift_pre) dops_.set_shift_pre(dops_.ctx, cfg_.v41);
   return true;
 }
@@ -882,7 +910,11 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     // layer, is what makes hc_pre the most expensive device entry point in the engine. `+ 1` because
     // the compressor may append a row before the indexer looks, which is the same margin
     // `want_qrnorm` uses below.
-    const bool idx_may_run = w.ratio == 4 && w.idx_wq_b && cfg_.index_topk < st.n_comp + 1u;
+    // V4.1 runs an indexer on its index-source layers, whatever their ratio — `ratio == 4` was V4's
+    // way of naming the same set and is false for every V4.1 layer. `is_index_source` is the
+    // identity-preserving form: on V4 it IS `ratio == 4`.
+    const bool idx_may_run = cfg_.is_index_source(l) && w.idx_wq_b &&
+                             cfg_.index_topk < st.n_comp + 1u;
     const bool host_norm = !dev_hc || idx_may_run;
     if (dev_hc) {
       // A refusal here means `norm` was never written, and everything downstream would then read a
@@ -917,16 +949,27 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     // cache outgrows index_topk — n_comp is pos/4, so below ~2048 positions it never runs at all.
     // Asking for qr_norm unconditionally forced a device synchronise per layer per token to deliver
     // a vector nobody read. `+ 1` because the compressor may append a row later this sublayer.
-    const bool want_qrnorm = (w.ratio == 4 && w.idx_wq_b && cfg_.index_topk < st.n_comp + 1u);
+    const bool want_qrnorm = idx_may_run;
     // The device owns the compressor's pooling window once anything has used the device path, so
     // decode has to use it too — a host-side pool here would run over a state that prefill stopped
     // updating. Both halves move together: the indexer's keys are the compressor's output.
-    const bool has_idx = w.ratio == 4 && w.idx_comp_wkv && w.idx_comp_wgate && w.idx_proj;
+    //
+    // "This layer BUILDS index keys", which is not the same question as "this layer indexes". V4:
+    // its own second compressor, on every ratio-4 layer. V4.1: `wk` applied to the KV compressor's
+    // pre-RoPE latent, on kv-source layers only — four of them against eight index sources.
+    const bool has_idx = cfg_.v41
+                             ? (cfg_.is_kv_source(l) && w.idx_wk && w.idx_k_norm)
+                             : (w.ratio == 4 && w.idx_comp_wkv && w.idx_comp_wgate && w.idx_proj);
     // `comp_wgate` is not required: V4.1's ratio-1 layers pool a single position and ship no gate,
     // and the device compressor takes h_sc = -1 for that (DenseW leaves .gpu at -1 when unbound).
     const bool dev_comp = dops_.compress_one && dops_.indexer_one && w.ratio && w.comp_wkv &&
                           (w.comp_wgate || cfg_.v41) && dev_hc && cfg_.is_kv_source(l);
-    const bool dev_index = dev_comp && has_idx && want_qrnorm && st.n_comp;
+    // Whether attn_q should leave qr_norm in VRAM for the indexer. On V4 an indexing layer always
+    // compresses too, so `dev_comp` came for free; on V4.1 it does not — layers 24, 28, 32 and 36
+    // index without owning a compressor or a key cache, and gating this on dev_comp would send
+    // their queries to the host and then refuse to score them.
+    const bool dev_index = want_qrnorm && st.n_comp && dev_hc && dops_.indexer_one &&
+                           (cfg_.v41 || (dev_comp && has_idx));
     if (dops_.want_qrn_dev) dops_.want_qrn_dev(dops_.ctx, dev_index);
 
     // ---- one launch for every matvec in this sublayer that reads `norm` ------------------------
@@ -1037,7 +1080,12 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
       CompressArgs ca;
       ca.layer = l; ca.n = 1; ca.pos0 = pos; ca.ratio = w.ratio; ca.n_out = n_out;
       ca.h_kv = w.comp_wkv.gpu; ca.h_sc = w.comp_wgate.gpu;
-      if (has_idx) {
+      if (has_idx && cfg_.v41) {
+        // V4.1: one projection off the latent this same call is about to produce. No second
+        // compressor, and no head weights here — those belong to the index-source layers, which
+        // are not this set, and indexer_one issues them itself.
+        ca.h_idx_wk = w.idx_wk.gpu; ca.idx_k_norm = w.idx_k_norm;
+      } else if (has_idx) {
         ca.h_ikv = w.idx_comp_wkv.gpu; ca.h_isc = w.idx_comp_wgate.gpu;
         ca.h_iproj = w.idx_proj.gpu;
         ca.idx_heads = INH;
@@ -1066,13 +1114,29 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
 
     AFF_PH(compressor);
     // ---- lightning indexer: which compressed rows this query may attend to --------------------
-    if (dev_comp && has_idx && st.n_comp && w.idx_wq_b && cfg_.index_topk < st.n_comp) {
+    //
+    // On V4 this runs where the compressor just ran. On V4.1 it runs on the INDEX-SOURCE layers,
+    // which are a superset of the kv sources — so the gate is `is_index_source` (inside
+    // idx_may_run) and not `dev_comp`. The layers between two sources run nothing here and attend
+    // under the mask the earlier source left, which is what `set_idx_owner` told the device.
+    const bool run_idx = idx_may_run && st.n_comp && cfg_.index_topk < st.n_comp &&
+                         (cfg_.v41 || (dev_comp && has_idx));
+    if (run_idx) {
       // On device, straight into the mask buffer attend() already reads. The query projection reads
       // qr_norm, which attn_q left in VRAM because want_qrn_dev asked it to.
-      const uint32_t keys = std::min<uint32_t>(st.n_idx_comp, st.n_comp);
-      if (!dops_.indexer_one(dops_.ctx, l, w.idx_wq_b.gpu, QR, INH, IHD, keys, st.n_comp,
-                             cfg_.index_topk, pos, ROT, rope_derive(w.rope, ROT)))
-        return;
+      IndexArgs ia;
+      ia.layer = l; ia.n = 1;
+      ia.h_wq_b = w.idx_wq_b.gpu; ia.qr = QR;
+      ia.n_head = INH; ia.dim = IHD;
+      ia.n_keys = std::min<uint32_t>(st.n_idx_comp, st.n_comp);
+      ia.n_mask = st.n_comp; ia.topk = cfg_.index_topk;
+      ia.pos0 = pos; ia.n_rot = ROT; ia.rope = rope_derive(w.rope, ROT);
+      if (cfg_.v41) {
+        ia.h_proj = w.idx_proj.gpu; ia.n_embd = E;
+        ia.scale = 1.0f / std::sqrt((float)(IHD * INH));
+        ia.hadamard = false;          // V4.1's fp4_act_quant does not rotate — see indexer_gpu.h
+      }
+      if (!dops_.indexer_one(dops_.ctx, ia)) return;
     }
 
     AFF_PH(indexer);
@@ -1491,7 +1555,9 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // The indexer engages once the compressed cache outgrows index_topk. Within a chunk that can
       // become true partway through, so the test is against the count the LAST token will see;
       // asking for qr_norm and `norm` when no token needs them costs a copy per layer.
-      const bool idx_may_run = w.ratio == 4 && w.idx_wq_b &&
+      // `is_index_source`, not `ratio == 4`: the two name the same set on V4, and only the first
+      // names anything at all on V4.1. Guarded on w.ratio because the divisor below is the layer's.
+      const bool idx_may_run = w.ratio && cfg_.is_index_source(l) && w.idx_wq_b &&
                                cfg_.index_topk < st.n_comp + live / w.ratio + 1u;
       // Null, not `normb`: neither host buffer this sublayer could ask for has a reader. The
       // compressors take `norm` on device and the indexer's query projection takes `qr_norm` there,
@@ -1517,7 +1583,10 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // the host is the ROW COUNT, which is arithmetic: one row per `ratio` positions, and the
       // per-token prefix of it that attention needs. The ratio-128 HCA layers go the same way; they
       // simply have no indexer half, so their pool is one window instead of two.
-      const bool has_idx = w.ratio == 4 && w.idx_comp_wkv && w.idx_comp_wgate;
+      // Whether this layer BUILDS index keys — see the decode path for why that is a different
+      // question from whether it indexes.
+      const bool has_idx = cfg_.v41 ? (cfg_.is_kv_source(l) && w.idx_wk && w.idx_k_norm)
+                                    : (w.ratio == 4 && w.idx_comp_wkv && w.idx_comp_wgate);
       const bool dev_comp = bops_.compress && w.ratio && w.comp_wkv && (w.comp_wgate || cfg_.v41) &&
                             cfg_.is_kv_source(l);
       uint32_t n_out = 0;
@@ -1530,8 +1599,15 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         CompressArgs ca;
         ca.layer = l; ca.n = live; ca.pos0 = pos0; ca.ratio = w.ratio; ca.n_out = n_out;
         ca.h_kv = w.comp_wkv.gpu; ca.h_sc = w.comp_wgate.gpu;
-        if (has_idx) { ca.h_ikv = w.idx_comp_wkv.gpu; ca.h_isc = w.idx_comp_wgate.gpu; }
-        ca.h_iproj = (has_idx && idx_may_run && w.idx_proj) ? w.idx_proj.gpu : -1;
+        if (has_idx && cfg_.v41) {
+          // See the decode path: V4.1's keys are one projection off the latent, and the head
+          // weights move to indexer_q, which runs on the index sources rather than on these.
+          ca.h_idx_wk = w.idx_wk.gpu; ca.idx_k_norm = w.idx_k_norm;
+        } else if (has_idx) {
+          ca.h_ikv = w.idx_comp_wkv.gpu; ca.h_isc = w.idx_comp_wgate.gpu;
+        }
+        ca.h_iproj =
+            (!cfg_.v41 && has_idx && idx_may_run && w.idx_proj) ? w.idx_proj.gpu : -1;
         ca.ape = w.comp_ape;   ca.norm = w.comp_norm;
         ca.iape = w.idx_comp_ape; ca.inorm = w.idx_comp_norm;
         ca.width = W; ca.idx_dim = IHD; ca.n_embd = E;
@@ -1553,7 +1629,13 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         const int32_t h = w.idx_wq_b.gpu;
         const uint64_t r = (uint64_t)INH * IHD;
         if (bops_.indexer_q) {
-          if (!bops_.indexer_q(bops_.ctx, h, r, QR, INH, IHD)) return false;
+          // V4.1's head weights ride along here. This hook runs on exactly the index-source layers,
+          // which is the set that needs them; V4's compressor above already issued its own, so it
+          // passes -1 and this is the call it always was.
+          const int32_t hp = (cfg_.v41 && w.idx_proj) ? w.idx_proj.gpu : -1;
+          if (!bops_.indexer_q(bops_.ctx, h, r, QR, INH, IHD, hp, E,
+                               1.0f / std::sqrt((float)(IHD * INH))))
+            return false;
         } else {
           float* y = iqb.data();
           if (!bops_.mv_host(bops_.ctx, 1, &h, &r, QR, 1, &y)) return false;
@@ -1595,6 +1677,12 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
           }
         } else if (shares_kv && (pos + 1) % w.ratio == 0 &&
                    st.n_comp < s->layer[w.kv_owner].n_comp) {
+          // V4.1's index keys are 1:1 with the compressed rows — one `wk` projection per emitted
+          // latent — so a reader's key prefix is its row prefix. Without this the index-source
+          // layers that are NOT kv sources (24, 28, 32, 36) would carry n_idx_comp == 0 and score
+          // against an empty key set, which reads as "the indexer admitted nothing" and attends to
+          // the sliding window alone.
+          if (cfg_.v41) ++st.n_idx_comp;
           // A layer that READS another's cache still needs its own per-token prefix: the rows exist
           // (the source emitted them earlier in this same chunk, so its total is already final),
           // but this layer never ran a compressor to count them. Same growth rule, bounded by what
@@ -1617,9 +1705,18 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
           idx_run = true;
         }
       }
-      if (idx_run && !bops_.indexer(bops_.ctx, l, live, ncompb.data(), idx_keys, INH, IHD,
-                                    cfg_.index_topk, pos0, ROT, rope_derive(w.rope, ROT)))
-        return false;
+      if (idx_run) {
+        IndexArgs ia;
+        ia.layer = l; ia.n = live; ia.n_comp = ncompb.data();
+        ia.h_wq_b = w.idx_wq_b.gpu; ia.qr = QR;
+        ia.n_head = INH; ia.dim = IHD;
+        ia.n_keys = idx_keys; ia.topk = cfg_.index_topk;
+        ia.pos0 = pos0; ia.n_rot = ROT; ia.rope = rope_derive(w.rope, ROT);
+        // n_mask is derived from ncompb on the device side, which already walks it for the
+        // per-token counts. Queries and head weights are in VRAM: indexer_q put them there.
+        ia.hadamard = !cfg_.v41;      // see the decode path
+        if (!bops_.indexer(bops_.ctx, ia)) return false;
+      }
       // Splits the bucket: everything above is pass one, the sequential HOST walk, and everything
       // below is the batched device work. They were charged to one timer and read as "attention".
       AFF_PH(indexer);

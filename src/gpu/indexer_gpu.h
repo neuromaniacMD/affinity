@@ -49,14 +49,19 @@ void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, c
                         const float* hw, float* out, uint32_t nb, uint32_t n_keys,
                         uint32_t n_head, void* stream);
 
-// RoPE tail + the indexer's QAT (128-wide Hadamard, then an E2M1 round trip per 32) over the whole
-// chunk's queries, in place. `q` is [n][n_head][kIdxDim] f32 and token t sits at position pos0 + t.
+// RoPE tail + the indexer's QAT (an E2M1 round trip per 32, behind an optional 128-wide Hadamard)
+// over the whole chunk's queries, in place. `q` is [n][n_head][kIdxDim] f32 and token t sits at
+// position pos0 + t.
 //
 // On the host this cost more than the scoring did, because `rope_tail` recomputes theta inside the
 // head loop when theta depends only on (pos, i).
+//
+// `hadamard` is V4's rotation and must match what wrote the KEYS — the two are quantised
+// independently and their scores only mean anything in a shared basis. V4 rotates both (here and
+// in compress_kernel<1>); V4.1 rotates neither (here and in idx_key_kernel).
 void idx_rope_qat_hip(float* q, uint32_t n, uint32_t n_head, uint32_t n_rot, uint32_t pos0,
                       float freq_scale, float theta_scale, float ext_factor, float lo, float hi,
-                      void* stream);
+                      void* stream, bool hadamard = true);
 
 // f32 [n][dim] -> E4M3 [n][dim] + one f32 scale a row, on device. `dim` is n_head*kIdxDim for a
 // query token and kIdxDim for a key.

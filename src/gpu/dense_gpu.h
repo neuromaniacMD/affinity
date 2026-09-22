@@ -165,8 +165,12 @@ public:
   // Take everything the compressor and indexer would otherwise grab on first use, at final size.
   // AFTER attn_init and batch_init (needs a_maxcomp_ and b_cap_), BEFORE StaticPlacement, which
   // sizes the expert slabs from hipMemGetInfo and keeps back only a fixed reserve.
+  // `key_layers`, when given, is one byte a layer marking the layers that OWN indexer keys — V4.1's
+  // kv sources. Null derives the V4 rule, where a key cache and an index-compressor ring are the
+  // same set.
   bool reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_t width, uint32_t idx_dim,
-                       uint32_t idx_heads, std::string* err);
+                       uint32_t idx_heads, std::string* err,
+                       const uint8_t* key_layers = nullptr);
 
   // ---- attention state, resident in VRAM ------------------------------------------------------
   // Per layer and bounded: `sliding` raw rows in a ring (attention is over a SET, so ring order is
@@ -451,8 +455,18 @@ private:
   // shared — which is why this maps reads rather than renaming the layer everywhere.
   // Empty means "every layer owns its own", i.e. V4.
   std::vector<uint32_t> kv_owner_;
+  // ---- shared top-k (DeepSeek-V4.1) ------------------------------------------------------------
+  //
+  // The same idea one level up. V4 ran an indexer on every ratio-4 layer, so the admission mask in
+  // `a_allow`/`b_allow` belonged to exactly the layer that had just written it. V4.1 names
+  // index-source layers, and the layers after one REUSE its top-k
+  // (`Attention._compress_topk_idxs`) — so the mask is valid for a RANGE of layers, and the
+  // `a_idx_layer_` guard has to ask who owns it rather than who is asking.
+  // Empty means "every layer runs its own", i.e. V4, where this is the identity.
+  std::vector<uint32_t> idx_owner_;
   bool shift_pre_ = false;
   uint32_t kvl(uint32_t l) const { return l < kv_owner_.size() ? kv_owner_[l] : l; }
+  uint32_t idxl(uint32_t l) const { return l < idx_owner_.size() ? idx_owner_[l] : l; }
   // The context a_comp_rows_ was sized for, and how much of it is backed at load. The gap between
   // them is address space that costs nothing until the sequence reaches it — which is 962 expert
   // slots at the shipped --kv-size, worth 19% of decode. See gpu/vmem.h.
@@ -548,7 +562,8 @@ private:
                            uint32_t n_rot);
   // The indexer's query projection straight into the device arena the indexer reads, skipping the
   // drain-and-copy-back batch_mv_host does. Must run before batch_indexer for the same chunk.
-  bool     batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t n_head, uint32_t dim);
+  bool     batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t n_head, uint32_t dim,
+                           int32_t h_proj, uint64_t n_embd, float scale);
   // `devp` is an Impl::Dev*, which this header cannot name — Impl is opaque here on purpose.
   bool     idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim);
   // Both of the layer's compressors for a whole chunk: five GEMMs, four transposes, two pooling
@@ -557,23 +572,43 @@ private:
   // Which layer's compressed cache each layer reads. See kv_owner_ above; the engine computes it
   // from the config's kv_source_layer_ids and hands it over once, at load.
   void     set_kv_owner(const uint32_t* owner, uint32_t n);
+  // Which layer's top-k each layer reads. See idx_owner_ above; same hand-over, same load.
+  void     set_idx_owner(const uint32_t* owner, uint32_t n);
+  // `idx_width` sizes V4's index-compressor ring; `idx_keys` asks for the KEY CACHE alone, which
+  // is what V4.1 needs — it has no second compressor but every kv-source layer still owns keys.
   bool     compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_t width,
-                         uint32_t idx_width);
+                         uint32_t idx_width, bool idx_keys = false);
+  // V4.1's index keys, built from the latent the KV compressor publishes rather than from a second
+  // compressor. `v41_idx_ok` is the shape contract for `wk`, whose input is the latent and not
+  // `norm`; `devp` is an Impl::Dev* and `rank` its index. Both no-ops on V4.
+  bool     v41_idx_ok(const Model::CompressArgs& a) const;
+  void     build_v41_keys(void* devp, size_t rank, const Model::CompressArgs& a, uint32_t n_out,
+                          void* stream);
   bool     compress_reset();
   // The same two compressors and indexer for one token — decode must run the device
   // implementation because the device owns the cross-chunk window prefill left behind.
   bool     compress_one(const Model::CompressArgs& a);
-  bool     indexer_one(uint32_t layer, int32_t h, uint64_t qr, uint32_t n_head, uint32_t dim,
-                       uint32_t n_keys, uint32_t n_mask, uint32_t topk, uint32_t pos,
-                       uint32_t n_rot, RopeDerived rope);
+  bool     indexer_one(const Model::IndexArgs& a);
   // Tells attn_q to keep qr_norm in VRAM for indexer_one instead of copying it to the host.
-  void     set_idx_want_qrn(bool v) { idx_want_qrn_ = v; a_idx_layer_[slot_] = -1; b_idx_layer_[slot_] = -1; }
+  //
+  // ⚠️ It also FORGETS the current admissions, and that is why it cannot do so on V4.1. This is
+  // called at the top of every layer, so on V4 — where every indexed layer runs its own indexer —
+  // clearing here is a free extra guard against a layer whose indexer stopped running inheriting
+  // the previous one's mask. On V4.1 the mask is deliberately shared from an index source to the
+  // layers after it, and clearing per layer would throw it away between the two, sending every
+  // consumer back to attending over the whole compressed cache: no error, no crash, just the
+  // unindexed attention this work exists to remove.
+  //
+  // What still invalidates it there is the same thing that always did the real work — hc_seed per
+  // token and batch_begin per chunk, both of which run before any layer.
+  void     set_idx_want_qrn(bool v) {
+    idx_want_qrn_ = v;
+    if (idx_owner_.empty()) { a_idx_layer_[slot_] = -1; b_idx_layer_[slot_] = -1; }
+  }
   // Scores every compressed row against every head, ReLU-weights them and takes the top `topk`,
   // leaving the admission mask on device where batch_attend already reads it. Must be followed by
   // batch_attend for the same tokens.
-  bool     batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp, uint32_t n_keys,
-                         uint32_t n_head, uint32_t dim, uint32_t topk, uint32_t pos0,
-                         uint32_t n_rot, RopeDerived rope);
+  bool     batch_indexer(const Model::IndexArgs& a);
   // One launch for tokens [b0, b0+n), which start at absolute position pos0. `allowed` is a host
   // [n][mask_stride] plane or null; `n_comp` is a host array of n counts.
   bool     batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t pos0,

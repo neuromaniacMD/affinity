@@ -328,6 +328,11 @@ struct DenseGpu::Impl {
     // This chunk's four projections, token-major, which is what the pool indexes by position.
     float* c_kv = nullptr;  float* c_sc = nullptr;
     float* ci_kv = nullptr; float* ci_sc = nullptr;
+    // V4.1's index keys, both DIM-major [dim][n_out] because that is the layout batch_gemm_hip
+    // reads and writes: `c_lat` is the compressor's pre-RoPE latent (width a_width_) and `ci_ky`
+    // is `wk` applied to it (width kIdxDim). Null on V4, which builds its keys from a second
+    // compressor and needs neither. Sized with the four above, off c_cap_tok.
+    float* c_lat = nullptr; float* ci_ky = nullptr;
     uint32_t c_cap_tok = 0;
     // The deferred decode compressor, per layer: `norm` for every position since this layer's last
     // pool, dim-major [n_embd][c_pcap], the layout batch_gemm_hip reads. Only the pool reads the
@@ -740,11 +745,12 @@ Model::DenseOps DenseGpu::ops() {
   o.set_kv_owner = [](void* c, const uint32_t* owner, uint32_t n) {
     static_cast<DenseGpu*>(c)->set_kv_owner(owner, n);
   };
+  o.set_idx_owner = [](void* c, const uint32_t* owner, uint32_t n) {
+    static_cast<DenseGpu*>(c)->set_idx_owner(owner, n);
+  };
   o.set_shift_pre = [](void* c, bool v) { static_cast<DenseGpu*>(c)->set_shift_pre(v); };
-  o.indexer_one = [](void* c, uint32_t l, int32_t h, uint64_t qr, uint32_t nh, uint32_t dim,
-                     uint32_t nk, uint32_t nm, uint32_t topk, uint32_t pos, uint32_t nr,
-                     RopeDerived rope) {
-    return static_cast<DenseGpu*>(c)->indexer_one(l, h, qr, nh, dim, nk, nm, topk, pos, nr, rope);
+  o.indexer_one = [](void* c, const Model::IndexArgs& a) {
+    return static_cast<DenseGpu*>(c)->indexer_one(a);
   };
   // Called at the top of every layer, which is also where last layer's admissions are forgotten:
   // a token whose indexer stopped running would otherwise inherit them.
@@ -845,6 +851,10 @@ DenseGpu::Split DenseGpu::split_for(const char* name) {
   // duplicate is cheaper than an exchange per layer.
   if (!std::strcmp(s, "comp_wkv") || !std::strcmp(s, "comp_wgate")) return Split::Rep;
   if (!std::strcmp(s, "idx_comp_wkv") || !std::strcmp(s, "idx_comp_wgate")) return Split::Rep;
+  // V4.1's index keys, which succeed that second compressor: `wk` reads the pooled latent — a
+  // whole row, already replicated — and writes into a replicated key cache that every card scores
+  // in full. 128x512 a layer on four layers, so the duplicate is noise against an exchange.
+  if (!std::strcmp(s, "idx_wk")) return Split::Rep;
   // 64 rows. The indexer weights every head by it and every card scores every head-group.
   if (!std::strcmp(s, "idx_proj")) return Split::Rep;
   // ---- DSpark ---------------------------------------------------------------------------------
@@ -2928,7 +2938,7 @@ bool DenseGpu::attn_run(uint32_t layer, const float* q, const uint8_t* allowed, 
     // The indexer writes a_allow for its OWN layer only. Keyed by layer rather than a bare flag: a
     // stale one would hand attention the previous layer's admissions, which is not a crash — it is
     // a model that quietly attends to the wrong rows.
-    const bool dev_mask = a_idx_layer_[slot_] == (int64_t)layer && n_comp;
+    const bool dev_mask = a_idx_layer_[slot_] == (int64_t)idxl(layer) && n_comp;
     if (!dev_mask && allowed && n_comp) {
       // The compressed-row mask is per TOKEN, not per head, so both cards get all of it.
       AFF_HIP_CHECK(hipMemcpyAsync(D.a_allow, allowed, n_comp, hipMemcpyHostToDevice, D.stream));
@@ -3382,7 +3392,8 @@ bool DenseGpu::draft_init(uint32_t n_embd, uint32_t tap_in, uint32_t vocab, uint
 // Every helper below is capacity-guarded and idempotent, so calling them here with the widest
 // arguments the run can present makes every later call a no-op rather than a resize.
 bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_t width,
-                               uint32_t idx_dim, uint32_t idx_heads, std::string* err) {
+                               uint32_t idx_dim, uint32_t idx_heads, std::string* err,
+                               const uint8_t* key_layers) {
   if (!impl_ || impl_->dev.empty()) { if (err) *err = "no device"; return false; }
   if (!attn_ok_) { if (err) *err = "attn_init must run first"; return false; }
   if (!ratios) { if (err) *err = "no per-layer ratios"; return false; }
@@ -3395,10 +3406,14 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
     for (uint32_t l = 0; l < n_layer; ++l) {
       const uint32_t r = ratios[l];
       if (!r) continue;                       // ratio 0 compresses nothing and allocates nothing
-      // The indexer half exists on the ratio-4 layers alone — the same rule batch_compress applies
-      // when it derives `has_idx` from whether the caller bound idx_comp_wkv/wgate.
+      // The index COMPRESSOR exists on the ratio-4 layers alone — the same rule batch_compress
+      // applies when it derives `has_idx` from whether the caller bound idx_comp_wkv/wgate. The
+      // KEY CACHE is a separate question on V4.1, where `key_layers` names the kv sources; without
+      // it those layers would take the early return below on their first real call and never get
+      // one. Null means V4, where owning a ring and owning keys are the same thing.
+      const bool keys = key_layers ? key_layers[l] != 0 : false;
       if (!compress_grow(&D, l, r, comp_width(r, width),
-                         r == 4u ? comp_width(r, idx_dim) : 0u)) {
+                         r == 4u ? comp_width(r, idx_dim) : 0u, keys)) {
         if (err) *err = "compressor state for layer " + std::to_string(l);
         return false;
       }
@@ -3406,12 +3421,15 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
     // The compressor's per-chunk projection arena. batch_compress sizes this from b_nb_, THIS
     // chunk's token count, which is never more than b_cap_.
     if (D.c_cap_tok < cap) {
-      for (void** p : {(void**)&D.c_kv, (void**)&D.c_sc, (void**)&D.ci_kv, (void**)&D.ci_sc})
+      for (void** p : {(void**)&D.c_kv, (void**)&D.c_sc, (void**)&D.ci_kv, (void**)&D.ci_sc,
+                       (void**)&D.c_lat, (void**)&D.ci_ky})
         if (*p) { (void)hipFree(*p); *p = nullptr; }
       if (!hip_try(hipMalloc(&D.c_kv, (size_t)cap * aw * sizeof(float)), "compressor kv", err) ||
           !hip_try(hipMalloc(&D.c_sc, (size_t)cap * aw * sizeof(float)), "compressor sc", err) ||
           !hip_try(hipMalloc(&D.ci_kv, (size_t)cap * aiw * sizeof(float)), "indexer kv", err) ||
-          !hip_try(hipMalloc(&D.ci_sc, (size_t)cap * aiw * sizeof(float)), "indexer sc", err))
+          !hip_try(hipMalloc(&D.ci_sc, (size_t)cap * aiw * sizeof(float)), "indexer sc", err) ||
+          !hip_try(hipMalloc(&D.c_lat, (size_t)cap * width * sizeof(float)), "compressor latent", err) ||
+          !hip_try(hipMalloc(&D.ci_ky, (size_t)cap * idx_dim * sizeof(float)), "indexer keys", err))
         return false;
       D.c_cap_tok = cap;
     }
@@ -3897,11 +3915,19 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
 // The indexer's query projection, left ON DEVICE in i_q. Same GEMM batch_mv_host would run, minus
 // the drain and the copy back — `idx_wq_b` is replicated, so this rank's shard is the whole matrix.
 bool DenseGpu::batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t n_head,
-                               uint32_t dim) {
+                               uint32_t dim, int32_t h_proj, uint64_t n_embd, float scale) {
   if (!b_nb_ || h < 0 || (size_t)h >= ent_.size()) return false;
   AFF_TRACE(23);
   const Entry& e = ent_[h];
   if (e.split != Split::Rep || rows != (uint64_t)n_head * dim) return false;
+  // V4.1's head weights. On V4 the compressor issued them and this is -1; here they have to run on
+  // the index-SOURCE layers, which are not the kv-source layers, so this hook is the only one that
+  // sees all of them. Same Rep/shape contract the compressor applies on V4.
+  if (h_proj >= 0) {
+    if ((size_t)h_proj >= ent_.size()) return false;
+    const Entry& ep = ent_[h_proj];
+    if (ep.split != Split::Rep || ep.cols != n_embd || ep.rows < n_head) return false;
+  }
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -3910,6 +3936,14 @@ bool DenseGpu::batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t
                    D.b_y, (uint32_t)rows, (uint32_t)cols, b_nb_, D.stream);
     // Dim-major [rows][nb] out of the GEMM; the indexer wants token-major [nb][rows].
     batch_transpose_hip(D.b_y, D.i_q, (uint32_t)rows, b_nb_, 1, D.stream);
+    if (h_proj >= 0) {
+      // Reads `norm`, not qr — a different activation, hence a second GEMM — and the
+      // 1/sqrt(dim*heads) folds into the transpose's store, exactly as batch_compress does it.
+      const Entry& ep = ent_[h_proj];
+      batch_gemm_hip(ep.quant, shard_rows(ep.sh[d], ep.quant, 0), shard_scales(ep.sh[d], 0),
+                     D.b_norm, D.b_y, n_head, (uint32_t)n_embd, b_nb_, D.stream);
+      batch_scale_transpose_hip(D.b_y, D.i_w, n_head, b_nb_, 1, scale, D.stream);
+    }
   }
   return true;
 }
@@ -3921,7 +3955,7 @@ bool DenseGpu::batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t
 // HOST walk this replaces was a quarter of the wall, most of it the device idling in a drain.
 // See gpu/compressor_gpu.h for why the pooling was never sequential.
 bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_t width,
-                             uint32_t idx_width) {
+                             uint32_t idx_width, bool idx_keys) {
   Impl::Dev& D = *(Impl::Dev*)devp;
   const uint32_t nl = (uint32_t)D.a_comp_s[slot_].size();
   if (layer >= nl) return false;
@@ -3944,14 +3978,19 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
   if (hipMalloc(&D.c_hkv_s[slot_][layer], hb) != hipSuccess) return false;
   if (hipMalloc(&D.c_hsc_s[slot_][layer], hb) != hipSuccess) return false;
   compressor_hist_reset_hip(D.c_hkv_s[slot_][layer], D.c_hsc_s[slot_][layer], width, hist, D.stream);
-  // The indexer half exists only on the ratio-4 layers; idx_width 0 says so.
+  // The index COMPRESSOR's pooling ring exists only on V4's ratio-4 layers; idx_width 0 says so.
+  // V4.1 has no such compressor and passes 0 here — but it still owns a key cache, built by `wk`
+  // off the KV latent, so the two allocations are asked for separately. Conflating them is what
+  // left build_v41_keys writing into a null cache on the first run.
   if (idx_width) {
     const size_t ihb = (size_t)hist * idx_width * sizeof(float);
     if (hipMalloc(&D.ci_hkv_s[slot_][layer], ihb) != hipSuccess) return false;
     if (hipMalloc(&D.ci_hsc_s[slot_][layer], ihb) != hipSuccess) return false;
+    compressor_hist_reset_hip(D.ci_hkv_s[slot_][layer], D.ci_hsc_s[slot_][layer], idx_width, hist, D.stream);
+  }
+  if (idx_keys || idx_width) {
     if (hipMalloc(&D.a_idx8_s[slot_][layer], (size_t)a_maxcomp_ * kIdxDim) != hipSuccess) return false;
     if (hipMalloc(&D.a_idxs_s[slot_][layer], (size_t)a_maxcomp_ * sizeof(float)) != hipSuccess) return false;
-    compressor_hist_reset_hip(D.ci_hkv_s[slot_][layer], D.ci_hsc_s[slot_][layer], idx_width, hist, D.stream);
   }
   D.c_ratio[layer] = ratio;
   return true;
@@ -3959,6 +3998,48 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
 
 void DenseGpu::set_kv_owner(const uint32_t* owner, uint32_t n) {
   kv_owner_.assign(owner, owner + n);
+}
+
+void DenseGpu::set_idx_owner(const uint32_t* owner, uint32_t n) {
+  idx_owner_.assign(owner, owner + n);
+}
+
+// ---- V4.1's index keys --------------------------------------------------------------------------
+//
+// V4 gave every indexed layer a second compressor and the key row fell out of it. V4.1 has none:
+// the indexer projects the KV compressor's own pre-RoPE latent with `wk`, norms it, rotates it at
+// the group's position and fp4s it. So the key build is two steps behind the pool rather than
+// beside it, and it runs on the kv-SOURCE layers only — the index sources that own no cache score
+// these same rows with their own queries.
+//
+// `wk` is the one compressor-adjacent matrix whose input is NOT `norm`: it reads the pooled latent,
+// so its column count is the attention head width. Checked here rather than in the n_embd loop that
+// covers the others, which would reject it for having the wrong shape when the shape is right.
+bool DenseGpu::v41_idx_ok(const Model::CompressArgs& a) const {
+  if (a.h_idx_wk < 0) return true;                 // V4, or a V4.1 layer that owns no keys
+  if (!a.idx_k_norm) return false;                 // the norm is not optional; see idx_key_kernel
+  if ((size_t)a.h_idx_wk >= ent_.size()) return false;
+  const Entry& e = ent_[a.h_idx_wk];
+  // Replicated for the same reason the rest of the compressor is: the key cache is whole rows and
+  // every card scores against all of them, so a Row split would be half a key per card.
+  return e.split == Split::Rep && e.cols == a.width && e.rows >= a.idx_dim;
+}
+
+void DenseGpu::build_v41_keys(void* devp, size_t rank, const Model::CompressArgs& a,
+                              uint32_t n_out, void* stream) {
+  if (!n_out || a.h_idx_wk < 0) return;
+  Impl::Dev& D = *(Impl::Dev*)devp;
+  hipStream_t st = (hipStream_t)stream;
+  const Entry& e = ent_[a.h_idx_wk];
+  // Dim-major [width][n_out] in, dim-major [idx_dim][n_out] out — compress_kernel wrote the latent
+  // in the layout this reads precisely so that no transpose sits between them.
+  batch_gemm_hip(e.quant, shard_rows(e.sh[rank], e.quant, 0), shard_scales(e.sh[rank], 0), D.c_lat,
+                 D.ci_ky, a.idx_dim, a.width, n_out, st);
+  // Into the SAME key cache and scale plane V4's mode-1 compressor writes, in the same format, so
+  // indexer_scores_hip cannot tell the two apart — which is the point.
+  idx_key_rows_hip(D.ci_ky, D.ci_norm[a.layer], D.a_idx8_s[slot_][a.layer],
+                   D.a_idxs_s[slot_][a.layer], a.idx_dim, a.idx_slot0, n_out, a.idx_dim, a.ratio,
+                   a.n_rot, a.rope, a.eps, st);
 }
 
 bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
@@ -3973,7 +4054,9 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
   // This layer's own allocation for the KV half; the indexer half exists only on ratio-4 layers and
   // those are the widest, so a_maxcomp_ is exactly right for it.
   if (a.slot0 + a.n_out > a_comp_rows_[a.layer]) return false;
-  if (has_idx && a.idx_slot0 + a.n_out > a_maxcomp_) return false;
+  // V4.1 emits one key per compressed row off `wk`, so its bound is the same one — stated
+  // explicitly rather than left to the fact that idx_slot0 tracks slot0 on that path.
+  if ((has_idx || a.h_idx_wk >= 0) && a.idx_slot0 + a.n_out > a_maxcomp_) return false;
   AFF_TRACE(32);
   const uint32_t cw = comp_width(a.ratio, a.width);
   const uint32_t iw = has_idx ? comp_width(a.ratio, a.idx_dim) : 0u;
@@ -3987,23 +4070,30 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
     if ((size_t)hs[i] >= ent_.size() || ent_[hs[i]].split != Split::Rep) return false;
     if (ent_[hs[i]].cols != a.n_embd || ent_[hs[i]].rows < rws[i]) return false;
   }
+  // V4.1's `wk` is checked apart because it is the one compressor-adjacent matrix that does NOT
+  // read `norm`: its input is the pooled latent, so its column count is the head width and not
+  // n_embd. Replicated for the same reason as the rest — every card needs the whole key row.
+  if (!v41_idx_ok(a)) return false;
   if ((uint64_t)2 * (cw + iw) > b_mid_) return false;
 
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     hipStream_t st = D.stream;
-    if (!compress_grow(&D, a.layer, a.ratio, cw, iw)) return false;
+    if (!compress_grow(&D, a.layer, a.ratio, cw, iw, a.h_idx_wk >= 0)) return false;
     // One arena for every layer, sized from the widest: the ratio-4 layers carry both halves of the
     // projection in one row and the ratio-128 layers half of that.
     const uint32_t aw = 2u * a_width_, aiw = 2u * kIdxDim;
     if (D.c_cap_tok < b_nb_) {
-      for (void** p : {(void**)&D.c_kv, (void**)&D.c_sc, (void**)&D.ci_kv, (void**)&D.ci_sc})
+      for (void** p : {(void**)&D.c_kv, (void**)&D.c_sc, (void**)&D.ci_kv, (void**)&D.ci_sc,
+                       (void**)&D.c_lat, (void**)&D.ci_ky})
         if (*p) { (void)hipFree(*p); *p = nullptr; }
       if (hipMalloc(&D.c_kv, (size_t)b_nb_ * aw * sizeof(float)) != hipSuccess) return false;
       if (hipMalloc(&D.c_sc, (size_t)b_nb_ * aw * sizeof(float)) != hipSuccess) return false;
       if (hipMalloc(&D.ci_kv, (size_t)b_nb_ * aiw * sizeof(float)) != hipSuccess) return false;
       if (hipMalloc(&D.ci_sc, (size_t)b_nb_ * aiw * sizeof(float)) != hipSuccess) return false;
+      if (hipMalloc(&D.c_lat, (size_t)b_nb_ * a_width_ * sizeof(float)) != hipSuccess) return false;
+      if (hipMalloc(&D.ci_ky, (size_t)b_nb_ * kIdxDim * sizeof(float)) != hipSuccess) return false;
       D.c_cap_tok = b_nb_;
     }
     // The layer's ape and norm weights, once, and ASYNCHRONOUSLY. A blocking hipMemcpy here waits
@@ -4024,6 +4114,14 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
         const size_t ab = (size_t)a.ratio * cw * sizeof(float);
         if (hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
         AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
+      }
+      // V4.1's `k_norm` takes the same slot V4's index-compressor norm does: same width, same
+      // lifetime, and the two never coexist — a layer has one indexer key source or the other.
+      if (a.h_idx_wk >= 0) {
+        if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
+          return false;
+        AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.idx_k_norm,
+                                     (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
       }
       if (has_idx) {
         if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
@@ -4098,7 +4196,10 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
       c.out = D.a_comp_s[slot_][a.layer];
       c.out_stride = kv_row_bytes(a_dt_, a_width_, a_rot_);
       c.slot0 = a.slot0; c.head_dim = a.width;
+      // V4.1: publish the pre-RoPE latent so `wk` can run over it below.
+      c.lat = (a.h_idx_wk >= 0) ? D.c_lat : nullptr;
       compressor_rows_hip(0, c, a.n, a.pos0, a.ratio, a.n_out, a.n_rot, a.rope, a.eps, st);
+      if (a.h_idx_wk >= 0) build_v41_keys(&D, d, a, a.n_out, st);
 
       if (has_idx) {
         CompressJob i{};
@@ -4138,7 +4239,9 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
   if (has_idx && a.idx_dim != kIdxDim) return false;
   if (a.layer >= impl_->dev[0].a_comp_s[slot_].size()) return false;
   if (a.slot0 + a.n_out > a_comp_rows_[a.layer]) return false;
-  if (has_idx && a.idx_slot0 + a.n_out > a_maxcomp_) return false;
+  // V4.1 emits one key per compressed row off `wk`, so its bound is the same one — stated
+  // explicitly rather than left to the fact that idx_slot0 tracks slot0 on that path.
+  if ((has_idx || a.h_idx_wk >= 0) && a.idx_slot0 + a.n_out > a_maxcomp_) return false;
   AFF_TRACE(32);
   const uint32_t cw = comp_width(a.ratio, a.width);
   const uint32_t iw = has_idx ? comp_width(a.ratio, a.idx_dim) : 0u;
@@ -4149,11 +4252,12 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
     if ((size_t)hs[i] >= ent_.size() || ent_[hs[i]].split != Split::Rep) return false;
     if (ent_[hs[i]].cols != a.n_embd || ent_[hs[i]].rows < rws[i]) return false;
   }
+  if (!v41_idx_ok(a)) return false;                // see batch_compress
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     hipStream_t st = D.stream;
-    if (!compress_grow(&D, a.layer, a.ratio, cw, iw)) return false;
+    if (!compress_grow(&D, a.layer, a.ratio, cw, iw, a.h_idx_wk >= 0)) return false;
     if (2u * (uint64_t)(cw + iw) + a.idx_heads > D.cap_mid) return false;
     // Same lazy upload as the batched path above, same reason for being async — see there.
     //
@@ -4167,6 +4271,14 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
         const size_t ab = (size_t)a.ratio * cw * sizeof(float);
         if (hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
         AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
+      }
+      // V4.1's `k_norm` takes the same slot V4's index-compressor norm does: same width, same
+      // lifetime, and the two never coexist — a layer has one indexer key source or the other.
+      if (a.h_idx_wk >= 0) {
+        if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
+          return false;
+        AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.idx_k_norm,
+                                     (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
       }
       if (has_idx) {
         if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
@@ -4221,12 +4333,15 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
     const uint32_t need_tok = std::max(b_nb_, cap);
     const uint32_t aw = 2u * a_width_, aiw = 2u * kIdxDim;
     if (D.c_cap_tok < need_tok) {
-      for (void** p : {(void**)&D.c_kv, (void**)&D.c_sc, (void**)&D.ci_kv, (void**)&D.ci_sc})
+      for (void** p : {(void**)&D.c_kv, (void**)&D.c_sc, (void**)&D.ci_kv, (void**)&D.ci_sc,
+                       (void**)&D.c_lat, (void**)&D.ci_ky})
         if (*p) { (void)hipFree(*p); *p = nullptr; }
       if (hipMalloc(&D.c_kv, (size_t)need_tok * aw * sizeof(float)) != hipSuccess) return false;
       if (hipMalloc(&D.c_sc, (size_t)need_tok * aw * sizeof(float)) != hipSuccess) return false;
       if (hipMalloc(&D.ci_kv, (size_t)need_tok * aiw * sizeof(float)) != hipSuccess) return false;
       if (hipMalloc(&D.ci_sc, (size_t)need_tok * aiw * sizeof(float)) != hipSuccess) return false;
+      if (hipMalloc(&D.c_lat, (size_t)need_tok * a_width_ * sizeof(float)) != hipSuccess) return false;
+      if (hipMalloc(&D.ci_ky, (size_t)need_tok * kIdxDim * sizeof(float)) != hipSuccess) return false;
       D.c_cap_tok = need_tok;
     }
     const uint32_t py_need = (aw + aw + aiw + aiw) * cap;
@@ -4328,7 +4443,9 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
         c.out = D.a_comp_s[slot_][a.layer];
         c.out_stride = kv_row_bytes(a_dt_, a_width_, a_rot_);
         c.slot0 = a.slot0; c.head_dim = a.width;
-        compressor_rows_hip(0, c, nb, pos0, a.ratio, a.n_out, a.n_rot, a.rope, a.eps, st);
+        c.lat = (a.h_idx_wk >= 0) ? D.c_lat : nullptr;
+      compressor_rows_hip(0, c, nb, pos0, a.ratio, a.n_out, a.n_rot, a.rope, a.eps, st);
+      if (a.h_idx_wk >= 0) build_v41_keys(&D, d, a, a.n_out, st);
 
         if (has_idx) {
           CompressJob i{};
@@ -4357,35 +4474,57 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
 // The lightning indexer for one token. Same five kernels the batched path runs, with n = 1 and the
 // mask landing in `a_allow`, which is where attn_run reads it — so nothing crosses the bus and the
 // host never sees a score.
-bool DenseGpu::indexer_one(uint32_t layer, int32_t h, uint64_t qr, uint32_t n_head, uint32_t dim,
-                           uint32_t n_keys, uint32_t n_mask, uint32_t topk, uint32_t pos,
-                           uint32_t n_rot, RopeDerived rope) {
-  if (!attn_ok_ || h < 0 || (size_t)h >= ent_.size() || dim != kIdxDim || !n_keys) return false;
+bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
+  const uint32_t layer = a.layer, n_head = a.n_head, topk = a.topk;
+  if (!attn_ok_ || a.h_wq_b < 0 || (size_t)a.h_wq_b >= ent_.size() || a.dim != kIdxDim ||
+      !a.n_keys)
+    return false;
   AFF_TRACE(28);
-  const Entry& e = ent_[h];
-  if (e.split != Split::Rep || e.rows < (uint64_t)n_head * dim || n_keys > a_maxcomp_) return false;
+  const Entry& e = ent_[a.h_wq_b];
+  if (e.split != Split::Rep || e.rows < (uint64_t)n_head * a.dim || a.n_keys > a_maxcomp_)
+    return false;
+  // V4.1's head weights, built here. Checked against the same Rep/shape contract the compressor
+  // applies to them on V4 — a Row-split `weights_proj` would be half a weight per card, silently.
+  if (a.h_proj >= 0) {
+    if ((size_t)a.h_proj >= ent_.size()) return false;
+    const Entry& ep = ent_[a.h_proj];
+    if (ep.split != Split::Rep || ep.cols != a.n_embd || ep.rows < n_head) return false;
+  }
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     hipStream_t st = D.stream;
-    if (!D.d_qrn || layer >= D.a_idx8_s[slot_].size() || !D.a_idx8_s[slot_][kvl(layer)] || !D.i_w) return false;
-    if (!idx_grow(&D, 1, n_head, dim)) return false;
-    launch_mv({e.sh[d].data, e.sh[d].scales, e.quant, e.sh[d].ps}, D.d_qrn, (uint32_t)(n_head * dim),
-              (uint32_t)qr, D.i_q, st);
-    idx_rope_qat_hip(D.i_q, 1, n_head, n_rot, pos, rope.freq_scale, rope.theta_scale,
-                     rope.ext_factor, rope.lo, rope.hi, st);
-    idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head * dim, st);
-    indexer_scores_hip(D.i_q8, D.i_qs, D.a_idx8_s[slot_][kvl(layer)], D.a_idxs_s[slot_][kvl(layer)], D.i_w, D.i_sc, 1, n_keys,
+    // The KEYS come from this layer's kv owner — on V4 that is the layer itself.
+    const uint32_t kl = kvl(layer);
+    if (!D.d_qrn || layer >= D.a_idx8_s[slot_].size() || !D.a_idx8_s[slot_][kl]) return false;
+    if (!idx_grow(&D, 1, n_head, a.dim)) return false;
+    if (!D.i_w) return false;                // idx_grow owns it; the projection below writes it
+    if (a.h_proj >= 0) {
+      // Straight into i_w with the 1/sqrt(dim*heads) folded into the store, exactly as the V4
+      // compressor does it — see compress_one. At one token the transpose that would follow is
+      // the identity, so there is none.
+      const Entry& ep = ent_[a.h_proj];
+      MvJob j{ep.sh[d].data, ep.sh[d].scales, ep.quant, n_head, D.i_w, a.scale};
+      matvec_batch_hip(&j, 1, D.d_norm, (uint32_t)a.n_embd, st, nullptr);
+    }
+    launch_mv({e.sh[d].data, e.sh[d].scales, e.quant, e.sh[d].ps}, D.d_qrn, (uint32_t)(n_head * a.dim),
+              (uint32_t)a.qr, D.i_q, st);
+    idx_rope_qat_hip(D.i_q, 1, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
+                     a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
+    idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head * a.dim, st);
+    indexer_scores_hip(D.i_q8, D.i_qs, D.a_idx8_s[slot_][kl], D.a_idxs_s[slot_][kl], D.i_w, D.i_sc, 1, a.n_keys,
                        n_head, st);
     // Null counts: at one token the score row IS its own prefix. The clear is over `n_mask`, the
     // attention's own row count for this token, and NOT over the plane's pitch: the pitch comes
     // from the cache's capacity, so at a 1M cache it is 262146 bytes however short the context is.
     const bool gather = topk <= kAdmCap;
-    idx_topk_mask_hip(D.i_sc, D.a_allow, nullptr, 1, n_keys, a_maxcomp_,
-                      n_mask > a_maxcomp_ ? a_maxcomp_ : n_mask, topk, st, &D.topk,
+    idx_topk_mask_hip(D.i_sc, D.a_allow, nullptr, 1, a.n_keys, a_maxcomp_,
+                      a.n_mask > a_maxcomp_ ? a_maxcomp_ : a.n_mask, topk, st, &D.topk,
                       gather ? D.a_adm : nullptr, gather ? D.a_admn : nullptr, kAdmCap);
   }
-  a_idx_layer_[slot_] = (int64_t)layer;
+  // Stamped with the layer that OWNS these admissions, which on V4.1 is the index source and on
+  // V4 is `layer` itself — attend() asks idxl(), so the layers between sources match too.
+  a_idx_layer_[slot_] = (int64_t)idxl(layer);
   a_idx_gather_[slot_] = topk <= kAdmCap;
   a_idx_topk_[slot_] = topk;
   ++st_.calls;
@@ -4409,10 +4548,10 @@ bool DenseGpu::compress_reset() {
   return true;
 }
 
-bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp, uint32_t n_keys,
-                             uint32_t n_head, uint32_t dim, uint32_t topk, uint32_t pos0,
-                             uint32_t n_rot, RopeDerived rope) {
-  if (!b_nb_ || !n || !n_keys || dim != kIdxDim) return false;
+bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
+  const uint32_t layer = a.layer, n = a.n, n_keys = a.n_keys, n_head = a.n_head, topk = a.topk;
+  const uint32_t* n_comp = a.n_comp;
+  if (!b_nb_ || !n || !n_keys || a.dim != kIdxDim || !n_comp) return false;
   AFF_TRACE(28);
   if (n > b_nb_ || n_keys > a_maxcomp_) return false;
   // What the ATTENTION will read of each mask row, which is its own compressed-row count and not
@@ -4425,21 +4564,22 @@ bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp,
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     hipStream_t st = D.stream;
-    if (!idx_grow(&D, n, n_head, dim)) return false;
+    if (!idx_grow(&D, n, n_head, a.dim)) return false;
     // The keys are ALREADY on device, in the form this wants: batch_compress wrote them as E4M3
     // rows with one f32 scale each when it emitted them. They used to arrive as host f32 — a
     // n_keys x 128 upload and a quantise pass, per layer per chunk, of rows that had not changed
     // since the chunk that produced them.
-    if (layer >= D.a_idx8_s[slot_].size() || !D.a_idx8_s[slot_][kvl(layer)]) return false;
+    const uint32_t kl = kvl(layer);          // the keys live under this layer's kv owner
+    if (layer >= D.a_idx8_s[slot_].size() || !D.a_idx8_s[slot_][kl]) return false;
     std::memcpy(D.hi_nc, n_comp, (size_t)n * sizeof(uint32_t));
     AFF_HIP_CHECK(hipMemcpyAsync(D.i_nc, D.hi_nc, (size_t)n * sizeof(uint32_t),
                                  hipMemcpyHostToDevice, st));
     // RoPE and QAT here, not on the host: i_q holds the projection's RAW output, and i_w the head
     // weights — batch_indexer_q and batch_compress wrote both, on device.
-    idx_rope_qat_hip(D.i_q, n, n_head, n_rot, pos0, rope.freq_scale, rope.theta_scale,
-                     rope.ext_factor, rope.lo, rope.hi, st);
+    idx_rope_qat_hip(D.i_q, n, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
+                     a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
     // One scale a token over all 64 heads; the keys' own scales came with them.
-    idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, n, n_head * dim, st);
+    idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, n, n_head * a.dim, st);
     // Scores in TILES of `i_tile_` tokens, because the score plane is [tokens][every candidate row]
     // and the candidate count is the context. Holding a whole 1536-token chunk of it costs 1.50 GiB
     // a card at a 1M cache, to carry values that idx_topk_mask consumes immediately and never reads
@@ -4450,8 +4590,8 @@ bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp,
     // Each token's row is independent, so tiling cannot move a score or a tie.
     for (uint32_t t0 = 0; t0 < n; t0 += i_tile_) {
       const uint32_t nt = std::min(i_tile_, n - t0);
-      indexer_scores_hip(D.i_q8 + (size_t)t0 * n_head * dim, D.i_qs + t0, D.a_idx8_s[slot_][kvl(layer)],
-                         D.a_idxs_s[slot_][kvl(layer)], D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys,
+      indexer_scores_hip(D.i_q8 + (size_t)t0 * n_head * a.dim, D.i_qs + t0, D.a_idx8_s[slot_][kl],
+                         D.a_idxs_s[slot_][kl], D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys,
                          n_head, st);
       // Straight into b_allow at the CHUNK's own token indexing; batch_attend then offsets by its
       // sub-batch. The mask never leaves the card.
@@ -4462,7 +4602,9 @@ bool DenseGpu::batch_indexer(uint32_t layer, uint32_t n, const uint32_t* n_comp,
                         gather ? D.b_admn + t0 : nullptr, kAdmCap);
     }
   }
-  b_idx_layer_[slot_] = (int64_t)layer;
+  // The index source that OWNS these admissions — see indexer_one for why the stamp is the owner
+  // and not the caller.
+  b_idx_layer_[slot_] = (int64_t)idxl(layer);
   a_idx_gather_[slot_] = topk <= kAdmCap;
   a_idx_topk_[slot_] = topk;
   ++st_.calls;
@@ -4478,7 +4620,7 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
   // The indexer writes b_allow for its OWN layer only. Keyed by layer rather than a bare flag: a
   // stale one would hand attention the previous layer's admissions, which is not a crash — it is a
   // model that quietly attends to the wrong rows.
-  const bool dev_mask = b_idx_layer_[slot_] == (int64_t)layer;
+  const bool dev_mask = b_idx_layer_[slot_] == (int64_t)idxl(layer);
   uint32_t n_comp_max = 0;
   if (n_comp) for (uint32_t t = 0; t < n; ++t) n_comp_max = std::max(n_comp_max, n_comp[t]);
   if (n_comp_max > a_maxcomp_) return false;          // caller falls back rather than truncating
@@ -5751,12 +5893,12 @@ Model::BatchOps DenseGpu::batch_ops() {
     return static_cast<DenseGpu*>(c)->batch_compress(a);
   };
   o.compress_reset = [](void* c) { return static_cast<DenseGpu*>(c)->compress_reset(); };
-  o.indexer_q = [](void* c, int32_t h, uint64_t r, uint64_t cols, uint32_t nh, uint32_t dim) {
-    return static_cast<DenseGpu*>(c)->batch_indexer_q(h, r, cols, nh, dim);
+  o.indexer_q = [](void* c, int32_t h, uint64_t r, uint64_t cols, uint32_t nh, uint32_t dim,
+                   int32_t hp, uint64_t ne, float sc) {
+    return static_cast<DenseGpu*>(c)->batch_indexer_q(h, r, cols, nh, dim, hp, ne, sc);
   };
-  o.indexer = [](void* c, uint32_t l, uint32_t n, const uint32_t* nc, uint32_t nk, uint32_t nh,
-                 uint32_t dim, uint32_t topk, uint32_t pos0, uint32_t n_rot, RopeDerived rope) {
-    return static_cast<DenseGpu*>(c)->batch_indexer(l, n, nc, nk, nh, dim, topk, pos0, n_rot, rope);
+  o.indexer = [](void* c, const Model::IndexArgs& a) {
+    return static_cast<DenseGpu*>(c)->batch_indexer(a);
   };
   o.attend = [](void* c, uint32_t l, uint32_t b0, uint32_t n, uint32_t p0, const uint8_t* a,
                 uint32_t ms, const uint32_t* nc, float s) {

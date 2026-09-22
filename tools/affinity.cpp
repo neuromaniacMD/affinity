@@ -988,10 +988,17 @@ int main(int argc, char** argv) {
     // score planes otherwise appear on first use, mid-prefill, long after placement has handed the
     // leftover VRAM to expert shards. At 1M that is 2.56 GiB arriving after the fact.
     std::vector<uint32_t> ratios(c.n_layer);
-    for (uint32_t l = 0; l < c.n_layer; ++l) ratios[l] = c.ratio_for(l);
+    // V4.1 splits "has an index compressor" from "owns index keys": its kv-source layers build the
+    // keys with `wk` and have no compressor of their own, so the key cache has to be reserved by
+    // that set and not by the ratio.
+    std::vector<uint8_t> key_layers(c.n_layer, 0);
+    for (uint32_t l = 0; l < c.n_layer; ++l) {
+      ratios[l] = c.ratio_for(l);
+      key_layers[l] = (c.v41 && c.is_kv_source(l)) ? 1 : 0;
+    }
     std::string rerr;
     if (!dense_gpu.reserve_runtime(c.n_layer, ratios.data(), c.head_dim, c.index_head_dim,
-                                   c.index_n_heads, &rerr))
+                                   c.index_n_heads, &rerr, c.v41 ? key_layers.data() : nullptr))
       aff::ui::out("runtime reservation: %s — expert placement will over-commit\n", rerr.c_str());
     vram.mark("compressor + indexer");
 

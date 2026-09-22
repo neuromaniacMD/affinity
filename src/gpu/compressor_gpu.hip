@@ -38,6 +38,72 @@ struct Window {
   }
 };
 
+// ---- the indexer's key row, from a rotated 128-wide vector ---------------------------------------
+//
+// Shared by V4's index compressor (mode 1 below, HADAMARD true) and V4.1's `wk` projection
+// (idx_key_kernel, HADAMARD false). One encoder, because two encoders for one cache format is how a
+// cache silently changes meaning — the scoring kernel cannot tell which wrote a row.
+//
+// `s` is head_dim floats and `s_sc` at least head_dim/32; both are the caller's LDS. HADAMARD is a
+// template parameter and therefore uniform across the block, which the __syncthreads() inside the
+// butterfly requires.
+template <bool HADAMARD>
+__device__ __forceinline__ void idx_key_store(float v, float* s, float* s_sc, uint32_t j,
+                                              uint32_t hd, uint8_t* __restrict__ out,
+                                              float* __restrict__ out_scale, uint64_t out_stride,
+                                              uint32_t row) {
+  if (HADAMARD) {
+    s[j] = v;
+    __syncthreads();
+    for (uint32_t stride = 1; stride < hd; stride <<= 1) {
+      float a = 0.0f, b = 0.0f;
+      uint32_t ia = 0, ib = 0;
+      if (j < hd / 2u) {
+        const uint32_t base = (j / stride) * 2u * stride, off = j % stride;
+        ia = base + off; ib = base + stride + off;
+        a = s[ia]; b = s[ib];
+      }
+      __syncthreads();
+      if (j < hd / 2u) { s[ia] = a + b; s[ib] = a - b; }
+      __syncthreads();
+    }
+    // 1/sqrt(hd) as a literal, because hd is 128 here and no runtime rsqrt reproduces these bits.
+    // The callers refuse any other width rather than letting the factor go quietly wrong.
+    v = s[j] * 0.08838834764831845f;
+    __syncthreads();
+  }
+  // ---- an E2M1 round trip per 32, with an E8M0 scale ---------------------------------------------
+  s[j] = fabsf(v);
+  __syncthreads();
+  if (j < hd / 32u) {
+    float amax = 0.0f;
+    for (uint32_t i = 0; i < 32u; ++i) amax = fmaxf(amax, s[j * 32u + i]);
+    s_sc[j] = exp2f(ceilf(log2f(fmaxf(amax, 7.052966104933725e-38f) / 6.0f)));
+  }
+  __syncthreads();
+  {
+    const float q = s_sc[j >> 5];
+    v = e2m1_round_d(fminf(6.0f, fmaxf(-6.0f, v / q))) * q;
+  }
+  __syncthreads();
+
+  // ---- the cache row: E4M3 with ONE scale, chosen the way idx_quant_kernel chooses it ------------
+  v = __half2float(__float2half(v));
+  s[j] = fabsf(v);
+  __syncthreads();
+  for (uint32_t o = hd >> 1; o; o >>= 1) {
+    if (j < o) s[j] = fmaxf(s[j], s[j + o]);
+    __syncthreads();
+  }
+  const float q = s[0] > 0.0f ? s[0] * (1.0f / 448.0f) : 1.0f;
+  if (j == 0) out_scale[row] = q;
+  // The hardware convert, not e4m3_enc: this row is read by the same kernel that used to quantise
+  // it, and two encoders for one format is how a cache silently changes meaning.
+  const float c = fminf(448.0f, fmaxf(-448.0f, v * (1.0f / q)));
+  const int pk8 = __builtin_amdgcn_cvt_pk_fp8_f32(c, c, 0, false);
+  out[(size_t)row * out_stride + j] = (uint8_t)(pk8 & 0xFF);
+}
+
 // One block per emitted row, `head_dim` threads. Shared: head_dim floats for the row, then
 // head_dim/64 + 1 for the group scales.
 template <int MODE>
@@ -46,7 +112,7 @@ __global__ void compress_kernel(Window win, const float* __restrict__ ape,
                                 float* __restrict__ out_scale, uint64_t out_stride, uint32_t slot0,
                                 uint32_t hd, uint32_t n_rot, uint32_t ratio, float freq_scale,
                                 float theta_scale, float ext_factor, float lo, float hi,
-                                float rms_eps) {
+                                float rms_eps, float* __restrict__ lat) {
   extern __shared__ float s[];
   float* s_sc = s + hd;
   const uint32_t j = threadIdx.x;
@@ -112,6 +178,15 @@ __global__ void compress_kernel(Window win, const float* __restrict__ ape,
   float v = pooled * (1.0f / sqrtf(s[0] / (float)hd + rms_eps)) * nrm[j];
   __syncthreads();
 
+  // The latent V4.1's indexer projects its keys from — published HERE, before the RoPE, because
+  // that is where the reference reads it (`Attention._compress_kv` runs the indexer and only then
+  // rotates and quantises this same storage). Null on every V4 layer and on a V4.1 layer that is
+  // not also an index-key owner.
+  // DIM-major, [hd][n_out]: `wk` runs over these as a batched GEMM and that is the activation
+  // layout it reads, so writing them this way costs a strided store here and saves a transpose
+  // launch per layer per chunk.
+  if (MODE == 0 && lat) lat[(size_t)j * gridDim.x + blockIdx.x] = v;
+
   // ---- rope_tail over the trailing n_rot, at the group's FIRST position ------------------------
   s[j] = v;
   __syncthreads();
@@ -167,55 +242,56 @@ __global__ void compress_kernel(Window win, const float* __restrict__ ape,
     return;
   }
 
-  // ---- indexer_qat: 128-wide Hadamard, then an E2M1 round trip per 32 --------------------------
-  s[j] = v;
-  __syncthreads();
-  for (uint32_t stride = 1; stride < hd; stride <<= 1) {
-    float a = 0.0f, b = 0.0f;
-    uint32_t ia = 0, ib = 0;
-    if (j < hd / 2u) {
-      const uint32_t base = (j / stride) * 2u * stride, off = j % stride;
-      ia = base + off; ib = base + stride + off;
-      a = s[ia]; b = s[ib];
-    }
-    __syncthreads();
-    if (j < hd / 2u) { s[ia] = a + b; s[ib] = a - b; }
-    __syncthreads();
-  }
-  // 1/sqrt(hd) as a literal, because hd is 128 here and no runtime rsqrt reproduces these bits.
-  // compressor_rows_hip refuses any other width rather than letting the factor go quietly wrong.
-  v = s[j] * 0.08838834764831845f;
-  __syncthreads();
-  s[j] = fabsf(v);
-  __syncthreads();
-  if (j < hd / 32u) {
-    float amax = 0.0f;
-    for (uint32_t i = 0; i < 32u; ++i) amax = fmaxf(amax, s[j * 32u + i]);
-    s_sc[j] = exp2f(ceilf(log2f(fmaxf(amax, 7.052966104933725e-38f) / 6.0f)));
-  }
-  __syncthreads();
-  {
-    const float q = s_sc[j >> 5];
-    v = e2m1_round_d(fminf(6.0f, fmaxf(-6.0f, v / q))) * q;
-  }
-  __syncthreads();
+  // ---- indexer_qat: the Hadamard round trip, then the E4M3 cache row ---------------------------
+  // V4's index compressor. Shared with V4.1's key path below, which passes HADAMARD false.
+  idx_key_store<true>(v, s, s_sc, j, hd, out, out_scale, out_stride, slot0 + blockIdx.x);
+}
 
-  // ---- the indexer's key row: E4M3 with ONE scale, chosen the way idx_quant_kernel chooses it ---
-  v = __half2float(__float2half(v));
-  s[j] = fabsf(v);
+// ---- V4.1's index key: k_norm(wk(latent)), rotated, fp4'd ---------------------------------------
+//
+// One block a row, `head_dim` threads, over the `wk` GEMM's output. Everything that made mode 1 a
+// single fused kernel is still fused here — it simply starts one projection later, because V4.1's
+// keys come off the KV compressor's latent rather than off a compressor of their own.
+//
+// The RoPE position is the row's own: cache row `slot0 + blockIdx.x` IS group `slot0 + blockIdx.x`,
+// and a latent stands for the first token of its group, so the position is that times `ratio`. Mode
+// 0 derives the same number the long way round (`pe + 1 - ratio`, from the emitting position) —
+// they agree, and this form is the one the reference writes.
+__global__ void idx_key_kernel(const float* __restrict__ src, const float* __restrict__ k_norm,
+                               uint8_t* __restrict__ out, float* __restrict__ out_scale,
+                               uint64_t out_stride, uint32_t slot0, uint32_t hd, uint32_t ratio,
+                               uint32_t n_rot, float freq_scale, float theta_scale,
+                               float ext_factor, float lo, float hi, float rms_eps) {
+  extern __shared__ float s[];
+  float* s_sc = s + hd;
+  const uint32_t j = threadIdx.x;
+  const uint32_t row = slot0 + blockIdx.x;
+
+  // `src` is dim-major, [hd][n_out] — see CompressJob::lat and the GEMM that produced it.
+  float v = src[(size_t)j * gridDim.x + blockIdx.x];
+
+  // ---- k_norm: RMSNorm over the 128, then the layer's own weight ------------------------------
+  s[j] = v * v;
   __syncthreads();
   for (uint32_t o = hd >> 1; o; o >>= 1) {
-    if (j < o) s[j] = fmaxf(s[j], s[j + o]);
+    if (j < o) s[j] += s[j + o];
     __syncthreads();
   }
-  const float q = s[0] > 0.0f ? s[0] * (1.0f / 448.0f) : 1.0f;
-  const uint32_t row = slot0 + blockIdx.x;
-  if (j == 0) out_scale[row] = q;
-  // The hardware convert, not e4m3_enc: this row is read by the same kernel that used to quantise
-  // it, and two encoders for one format is how a cache silently changes meaning.
-  const float c = fminf(448.0f, fmaxf(-448.0f, v * (1.0f / q)));
-  const int pk8 = __builtin_amdgcn_cvt_pk_fp8_f32(c, c, 0, false);
-  out[(size_t)row * out_stride + j] = (uint8_t)(pk8 & 0xFF);
+  v = v * (1.0f / sqrtf(s[0] / (float)hd + rms_eps)) * k_norm[j];
+  __syncthreads();
+
+  // ---- rope_tail over the trailing n_rot, at the group's own position --------------------------
+  s[j] = v;
+  __syncthreads();
+  const uint32_t n_nope = hd - n_rot;
+  if (j >= n_nope && ((j - n_nope) & 1u) == 0u)
+    rope_pair(s + n_nope, (j - n_nope) >> 1, row * ratio, freq_scale, theta_scale, ext_factor, lo,
+              hi, 1.0f);
+  __syncthreads();
+  v = s[j];
+  __syncthreads();
+
+  idx_key_store<false>(v, s, s_sc, j, hd, out, out_scale, out_stride, row);
 }
 
 // The chunk's last `hist` positions into their own ring slots, the main and index halves at once
@@ -276,12 +352,33 @@ void compressor_rows_hip(int mode, const CompressJob& j, uint32_t n, uint32_t po
     hipLaunchKernelGGL(compress_kernel<0>, dim3(n_out), dim3(hd), lds, (hipStream_t)stream, w, j.ape,
                        j.norm, j.out, j.out_scale, j.out_stride, j.slot0, hd, n_rot, ratio,
                        rope.freq_scale, rope.theta_scale, rope.ext_factor, rope.lo, rope.hi,
-                       rms_eps);
+                       rms_eps, j.lat);
   else
+    // `lat` is mode 0's alone: the indexer's own compressor has no consumer for its intermediate,
+    // and V4.1 — the only caller that asks for one — has no mode-1 layer at all.
     hipLaunchKernelGGL(compress_kernel<1>, dim3(n_out), dim3(hd), lds, (hipStream_t)stream, w, j.ape,
                        j.norm, j.out, j.out_scale, j.out_stride, j.slot0, hd, n_rot, ratio,
                        rope.freq_scale, rope.theta_scale, rope.ext_factor, rope.lo, rope.hi,
-                       rms_eps);
+                       rms_eps, nullptr);
+  AFF_HIP_CHECK(hipGetLastError());
+}
+
+void idx_key_rows_hip(const float* src, const float* k_norm, uint8_t* out, float* out_scale,
+                      uint64_t out_stride, uint32_t slot0, uint32_t n_out, uint32_t head_dim,
+                      uint32_t ratio, uint32_t n_rot, RopeDerived rope, float rms_eps,
+                      void* stream) {
+  if (!n_out || !ratio) return;
+  // Same 128-wide contract as mode 1, for the same reason — the scoring kernel is compiled for
+  // kIdxDim and a key row of any other width is not a key row.
+  if (head_dim != 128u) {
+    aff::ui::fatal("fatal: the V4.1 index key is compiled for a 128-wide head and was given %u.\n",
+                 head_dim);
+    std::abort();
+  }
+  const size_t lds = ((size_t)head_dim + head_dim / 32u + 1u) * sizeof(float);
+  hipLaunchKernelGGL(idx_key_kernel, dim3(n_out), dim3(head_dim), lds, (hipStream_t)stream, src,
+                     k_norm, out, out_scale, out_stride, slot0, head_dim, ratio, n_rot,
+                     rope.freq_scale, rope.theta_scale, rope.ext_factor, rope.lo, rope.hi, rms_eps);
   AFF_HIP_CHECK(hipGetLastError());
 }
 

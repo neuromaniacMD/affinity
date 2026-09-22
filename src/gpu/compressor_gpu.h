@@ -62,6 +62,15 @@ struct CompressJob {
   uint64_t out_stride = 0;
   uint32_t slot0 = 0;
   uint32_t head_dim = 0;
+  // Mode 0 only, and optional: the latent AFTER the pool and the norm but BEFORE the RoPE and the
+  // QAT, [n_out][head_dim] f32, row g of this chunk at `lat + g*head_dim`.
+  //
+  // This is what V4.1's indexer projects its keys from. V4 built index keys from a second
+  // compressor (mode 1 below) and never needed the intermediate; V4.1 has no such compressor, and
+  // the reference is explicit that the indexer runs on the latent before Attention rotates and
+  // quantises that same storage (`Attention._compress_kv`). Publishing it costs one store per row
+  // and is skipped entirely when null, which is every V4 layer.
+  float* lat = nullptr;
 };
 
 // `n_out` rows for positions pos0 .. pos0+n-1: every p in that range with (p+1) % ratio == 0.
@@ -72,6 +81,26 @@ struct CompressJob {
 void compressor_rows_hip(int mode, const CompressJob& j, uint32_t n, uint32_t pos0, uint32_t ratio,
                          uint32_t n_out, uint32_t n_rot, RopeDerived rope, float rms_eps,
                          void* stream);
+
+// ---- V4.1's index keys ------------------------------------------------------------------------
+//
+// V4 gave every indexed layer its own compressor and the key row fell out of it (mode 1 above).
+// V4.1 instead projects the KV compressor's latent: `k = k_norm(wk(latent))`, RoPE over the
+// trailing `n_rot`, then the same fp4 round trip. So the two stages that mode 1 fused are split
+// here — the caller runs `wk` as a GEMM over `CompressJob::lat`, and this finishes the row.
+//
+// `src` is that GEMM's output, [n][head_dim] f32 TOKEN-major, row g of this chunk. `slot0 + g` is
+// the cache row, and — the point of the exercise — the group it stands for, so its RoPE position is
+// `(slot0 + g) * ratio`: a latent speaks for the FIRST token of its group.
+//
+// ⚠️ NO Hadamard, unlike mode 1. The V4.1 reference's `fp4_act_quant` is a plain per-32 E2M1 round
+// trip with an E8M0 scale and the word does not appear in its source at all. The rotation is
+// orthogonal, so running it anyway would not produce nonsense — it would round in a different basis
+// and quietly diverge from the reference, which is the worst of both.
+void idx_key_rows_hip(const float* src, const float* k_norm, uint8_t* out, float* out_scale,
+                      uint64_t out_stride, uint32_t slot0, uint32_t n_out, uint32_t head_dim,
+                      uint32_t ratio, uint32_t n_rot, RopeDerived rope, float rms_eps,
+                      void* stream);
 
 
 // score = -1e30, kv = 0: the empty-state values, so a position before the sequence begins

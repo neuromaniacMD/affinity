@@ -348,6 +348,49 @@ public:
     float iscale = 0.0f;                      // 1/sqrt(idx_dim * idx_heads), folded in on device
     RopeDerived rope{};
     float eps = 0.0f;
+    // ---- V4.1's index keys ---------------------------------------------------------------------
+    //
+    // V4 built them from a second compressor (`h_ikv`/`h_isc` above). V4.1 has none: the indexer
+    // projects the KV compressor's own latent with `wk`, norms it with `idx_k_norm` and rotates it
+    // at the group's position. Set only on a kv-source layer of a V4.1 model; -1/null everywhere
+    // else, and then the V4 path runs exactly as it did.
+    int32_t h_idx_wk = -1;
+    const float* idx_k_norm = nullptr;
+  };
+
+  // Everything one layer's lightning indexer needs, for one token or a whole chunk.
+  //
+  // `n_keys` is what the indexer SCORES and `n_mask` what the attention will READ — on V4 the two
+  // compressors have separate capacities, so the second can be the larger and the rows between them
+  // must come back "not admitted" rather than stale. (On V4.1 the index keys are 1:1 with the
+  // compressed rows and the two agree, but the mask still has to be cleared to `n_mask`.)
+  //
+  // `layer` is the layer ASKING. Where its keys live and which layer's name the resulting mask is
+  // stamped with are both resolved on the device side, from the owner tables above — a consumer
+  // layer never learns that it is reading someone else's.
+  struct IndexArgs {
+    uint32_t layer = 0, n = 1;
+    int32_t  h_wq_b = -1;                 // the query projection, read from qr_norm
+    uint64_t qr = 0;                      // its input width, q_lora_rank
+    uint32_t n_head = 0, dim = 0;
+    uint32_t n_keys = 0, n_mask = 0, topk = 0;
+    uint32_t pos0 = 0, n_rot = 0;
+    RopeDerived rope{};
+    // Prefill only: the per-token compressed-row prefix, `n` entries. The cache grows inside a
+    // chunk, so each token sees its own. Null at decode, where the score row IS its own prefix.
+    const uint32_t* n_comp = nullptr;
+    // ---- V4.1 only -------------------------------------------------------------------------
+    // `weights_proj`, the indexer's per-token head weights. Built HERE because an index-source
+    // layer need not be a kv-source layer and so need not have run the compressor at all — V4
+    // issues this same matvec inside its compressor, where it rides a staging copy, and leaves
+    // this at -1.
+    int32_t  h_proj = -1;
+    uint64_t n_embd = 0;
+    float    scale = 0.0f;                // 1/sqrt(dim*n_head), folded into the projection
+    // Whether the query QAT rotates. MUST match what wrote the keys: queries and keys are
+    // quantised independently and their scores mean nothing outside a shared basis. V4 rotates
+    // both, V4.1 neither. See gpu/indexer_gpu.h.
+    bool     hadamard = true;
   };
 
   // Device execution of the dense path. Registered before load() so the loader can hand every
@@ -431,12 +474,13 @@ public:
     // the PREVIOUS one computed. V4's own reference collapses with its own, which is what affinity
     // has always done, so this is off there and nothing about that path changes.
     void (*set_shift_pre)(void* ctx, bool v) = nullptr;
-    // `n_keys` is what the indexer SCORES and `n_mask` what the attention will READ — the two
-    // compressors have separate capacities, so the second can be the larger and the rows between
-    // them must come back "not admitted" rather than stale.
-    bool (*indexer_one)(void* ctx, uint32_t layer, int32_t h, uint64_t qr, uint32_t n_head,
-                        uint32_t dim, uint32_t n_keys, uint32_t n_mask, uint32_t topk, uint32_t pos,
-                        uint32_t n_rot, RopeDerived rope) = nullptr;
+    // Which layer's TOP-K each layer reads. V4.1 names index-source layers and the layers after one
+    // reuse its admissions; on V4 every indexed layer runs its own and this is the identity. Handed
+    // over beside set_kv_owner, and for the same reason: the mask buffer is one plane, and without
+    // this the guard on it asks "did THIS layer write it" and a consumer silently attends to
+    // everything.
+    void (*set_idx_owner)(void* ctx, const uint32_t* owner, uint32_t n) = nullptr;
+    bool (*indexer_one)(void* ctx, const IndexArgs& a) = nullptr;
     // Tells attn_q to keep qr_norm in VRAM for indexer_one rather than copying it to the host.
     void (*want_qrn_dev)(void* ctx, bool v) = nullptr;
     bool (*attend)(void* ctx, uint32_t layer, const float* q, const uint8_t* allowed,
@@ -546,15 +590,15 @@ public:
     bool (*attend)(void* ctx, uint32_t layer, uint32_t b0, uint32_t n, uint32_t pos0,
                    const uint8_t* allowed, uint32_t mask_stride, const uint32_t* n_comp,
                    float scale) = nullptr;
-    // The indexer's query projection, left on device for `indexer` to consume.
+    // The indexer's query projection, left on device for `indexer` to consume. `h_proj` is V4.1's
+    // head weights, issued on the same launch because on V4.1 this is the only hook that runs on
+    // every index-source layer — see IndexArgs::h_proj. V4 passes -1 and its compressor does it.
     bool (*indexer_q)(void* ctx, int32_t h, uint64_t rows, uint64_t cols, uint32_t n_head,
-                      uint32_t dim) = nullptr;
+                      uint32_t dim, int32_t h_proj, uint64_t n_embd, float scale) = nullptr;
     // The lightning indexer for a whole chunk. Queries, head weights and keys are all already in
     // VRAM — indexer_q and compress put them there — so only the per-token counts come from here.
     // Leaves the admission mask on device, so `attend` is called with a null `allowed`.
-    bool (*indexer)(void* ctx, uint32_t layer, uint32_t n, const uint32_t* n_comp, uint32_t n_keys,
-                    uint32_t n_head, uint32_t dim, uint32_t topk, uint32_t pos0, uint32_t n_rot,
-                    RopeDerived rope) = nullptr;
+    bool (*indexer)(void* ctx, const IndexArgs& a) = nullptr;
     bool (*attn_out)(void* ctx, int32_t woa, int32_t wob, uint32_t n_head, uint32_t width,
                      uint32_t n_rot, RopeDerived rope, uint32_t n_groups, uint64_t rank,
                      uint64_t hidden) = nullptr;
@@ -922,6 +966,9 @@ private:
   mutable std::vector<float> dspark_emb_;
   // layer -> the layer whose compressed KV it reads; see LayerWeights::kv_owner.
   std::vector<uint32_t> kv_owner_;
+  // layer -> the index-source layer whose top-k it reads. V4.1 only; identity on V4, where every
+  // indexed layer runs its own indexer.
+  std::vector<uint32_t> idx_owner_;
   DenseW hc_head_fn_;
   const float* hc_head_base_ = nullptr;
   const float* hc_head_scale_ = nullptr;

@@ -641,6 +641,7 @@ __device__ __forceinline__ float yarn_ramp_dev(float low, float high, int i) {
   return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
 }
 
+template <bool HADAMARD>
 __global__ __launch_bounds__(128) void idx_rope_qat_kernel(float* __restrict__ q, uint32_t n_head,
                                                            uint32_t n_rot, uint32_t pos0,
                                                            float freq_scale, float theta_scale,
@@ -668,23 +669,28 @@ __global__ __launch_bounds__(128) void idx_rope_qat_kernel(float* __restrict__ q
     v = (j & 1u) ? (partner * sn + v * c) : (v * c - partner * sn);
   }
 
-  r[i] = v;
-  __syncthreads();
-  // 128-wide Hadamard: 64 butterflies a stage, one per thread below 64.
-  for (uint32_t stride = 1; stride < kIdxDim; stride <<= 1) {
-    float a = 0.0f, b = 0.0f;
-    uint32_t ia = 0, ib = 0;
-    if (i < kIdxDim / 2u) {
-      const uint32_t base = (i / stride) * 2u * stride, off = i % stride;
-      ia = base + off; ib = base + stride + off;
-      a = r[ia]; b = r[ib];
+  // HADAMARD is V4's. V4.1's `fp4_act_quant` is a plain per-32 round trip with no rotation at all,
+  // and the queries have to be quantised in the SAME basis as the keys or the scores are a product
+  // of two different approximations. Uniform across the block, as the __syncthreads() below needs.
+  if (HADAMARD) {
+    r[i] = v;
+    __syncthreads();
+    // 128-wide Hadamard: 64 butterflies a stage, one per thread below 64.
+    for (uint32_t stride = 1; stride < kIdxDim; stride <<= 1) {
+      float a = 0.0f, b = 0.0f;
+      uint32_t ia = 0, ib = 0;
+      if (i < kIdxDim / 2u) {
+        const uint32_t base = (i / stride) * 2u * stride, off = i % stride;
+        ia = base + off; ib = base + stride + off;
+        a = r[ia]; b = r[ib];
+      }
+      __syncthreads();
+      if (i < kIdxDim / 2u) { r[ia] = a + b; r[ib] = a - b; }
+      __syncthreads();
     }
-    __syncthreads();
-    if (i < kIdxDim / 2u) { r[ia] = a + b; r[ib] = a - b; }
-    __syncthreads();
+    v = r[i] * 0.08838834764831845f;            // 1/sqrt(128)
   }
 
-  v = r[i] * 0.08838834764831845f;              // 1/sqrt(128)
   float amax = fabsf(v);
 #pragma unroll
   for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o));
@@ -714,10 +720,16 @@ void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, c
 
 void idx_rope_qat_hip(float* q, uint32_t n, uint32_t n_head, uint32_t n_rot, uint32_t pos0,
                       float freq_scale, float theta_scale, float ext_factor, float lo, float hi,
-                      void* stream) {
+                      void* stream, bool hadamard) {
   if (!n || !n_head) return;
-  hipLaunchKernelGGL(idx_rope_qat_kernel, dim3(n * n_head), dim3(kIdxDim), 0, (hipStream_t)stream,
-                     q, n_head, n_rot, pos0, freq_scale, theta_scale, ext_factor, lo, hi);
+  if (hadamard)
+    hipLaunchKernelGGL(idx_rope_qat_kernel<true>, dim3(n * n_head), dim3(kIdxDim), 0,
+                       (hipStream_t)stream, q, n_head, n_rot, pos0, freq_scale, theta_scale,
+                       ext_factor, lo, hi);
+  else
+    hipLaunchKernelGGL(idx_rope_qat_kernel<false>, dim3(n * n_head), dim3(kIdxDim), 0,
+                       (hipStream_t)stream, q, n_head, n_rot, pos0, freq_scale, theta_scale,
+                       ext_factor, lo, hi);
   AFF_HIP_CHECK(hipGetLastError());
 }
 
