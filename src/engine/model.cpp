@@ -392,6 +392,7 @@ bool Model::load(const std::string& aff_path, std::string* err) {
   cfg_.n_layer = (uint32_t)std::min<uint64_t>(cfg_.n_layer, aff_.layer_count());
   if (max_layers_) cfg_.n_layer = std::min(cfg_.n_layer, max_layers_);
   if (index_topk_override_) cfg_.index_topk = index_topk_override_;
+  if (cand_topk_override_) cfg_.candidate_topk_blocks = cand_topk_override_;
   layers_.resize(cfg_.n_layer);
 
   for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
@@ -1135,6 +1136,9 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
         ia.h_proj = w.idx_proj.gpu; ia.n_embd = E;
         ia.scale = 1.0f / std::sqrt((float)(IHD * INH));
         ia.hadamard = false;          // V4.1's fp4_act_quant does not rotate — see indexer_gpu.h
+        ia.cand_source = cfg_.candidate_source_layer;
+        ia.cand_topk_blocks = cfg_.candidate_topk_blocks;
+        ia.cand_block = cfg_.candidate_block;
       }
       if (!dops_.indexer_one(dops_.ctx, ia)) return;
     }
@@ -1715,6 +1719,11 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         // n_mask is derived from ncompb on the device side, which already walks it for the
         // per-token counts. Queries and head weights are in VRAM: indexer_q put them there.
         ia.hadamard = !cfg_.v41;      // see the decode path
+        if (cfg_.v41) {
+          ia.cand_source = cfg_.candidate_source_layer;
+          ia.cand_topk_blocks = cfg_.candidate_topk_blocks;
+          ia.cand_block = cfg_.candidate_block;
+        }
         if (!bops_.indexer(bops_.ctx, ia)) return false;
       }
       // Splits the bucket: everything above is pass one, the sequential HOST walk, and everything

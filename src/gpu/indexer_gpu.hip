@@ -699,6 +699,57 @@ __global__ __launch_bounds__(128) void idx_rope_qat_kernel(float* __restrict__ q
   g[i] = e2m1_round_d(fminf(6.0f, fmaxf(-6.0f, v / sc))) * sc;
 }
 
+
+// ---- the candidate pre-filter, level one of V4.1's two-level top-k -------------------------------
+//
+// `select_candidate_blocks` in the reference (model.py:583). Layer 20 scores blocks of 8 compressed
+// positions by their BEST position, keeps the 2048 best blocks, and publishes that set; the index
+// sources after it (24, 28, 32, 36) score with their own weights but may only SELECT inside it.
+//
+// ⚠️ It does not cut the scoring — every index source still computes the whole [tokens][keys] score
+// plane, exactly as it did. What it cuts is the CHOICE. So this is a correctness feature and not a
+// speed one, and it changes nothing at all below `candidate_topk_blocks * candidate_block_size`
+// positions (16,384 here), where every block is kept.
+
+// One block a (token, block-row) tile: bsc[t][b] = max of scores[t][s] over the block, with
+// unreachable positions left out by the per-token key count.
+//
+// The block holding the token's NEWEST position is pinned at +inf, as the reference pins it: it is
+// partly filled, so it holds the most recent tokens and could otherwise be outscored by an older
+// full block.
+__global__ void idx_block_max_kernel(const float* __restrict__ sc, float* __restrict__ bsc,
+                                     const uint32_t* __restrict__ nkeys, uint32_t sstride,
+                                     uint32_t bstride, uint32_t nb_blocks, uint32_t block,
+                                     uint32_t keys_all) {
+  const uint32_t t = blockIdx.y;
+  const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= nb_blocks) return;
+  const uint32_t keys = nkeys ? nkeys[t] : keys_all;
+  const uint32_t lo = b * block;
+  float m = -INFINITY;
+  if (lo < keys) {
+    const uint32_t hi = min(lo + block, keys);
+    const float* row = sc + (size_t)t * sstride;
+    for (uint32_t s = lo; s < hi; ++s) m = fmaxf(m, row[s]);
+    // The reference's `scores.masked_fill(arange(num_blocks) == last, inf)`.
+    if (keys && b == (keys - 1u) / block) m = INFINITY;
+  }
+  bsc[(size_t)t * bstride + b] = m;
+}
+
+// Level two's input: everything outside the published set becomes unreachable, so the layer's own
+// top-k can only pick inside it. In place, because the score plane is consumed by the top-k
+// immediately and read by nothing else.
+__global__ void idx_apply_cand_kernel(float* __restrict__ sc, const uint8_t* __restrict__ cand,
+                                      const uint32_t* __restrict__ nkeys, uint32_t sstride,
+                                      uint32_t cstride, uint32_t block, uint32_t keys_all) {
+  const uint32_t t = blockIdx.y;
+  const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t keys = nkeys ? nkeys[t] : keys_all;
+  if (s >= keys) return;
+  if (!cand[(size_t)t * cstride + s / block]) sc[(size_t)t * sstride + s] = -INFINITY;
+}
+
 }  // namespace
 
 void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, const float* ks,
@@ -812,6 +863,26 @@ void idx_encode_rows(const float* src, uint8_t* dst, float* scale, uint32_t n, u
       dst[(size_t)r * dim + i] = b;
     }
   }
+}
+
+void idx_block_max_hip(const float* scores, float* bsc, const uint32_t* nkeys, uint32_t nb,
+                       uint32_t sstride, uint32_t bstride, uint32_t nb_blocks, uint32_t block,
+                       uint32_t keys_all, void* stream) {
+  if (!nb || !nb_blocks || !block) return;
+  const dim3 g((nb_blocks + 255u) / 256u, nb), b(256);
+  hipLaunchKernelGGL(idx_block_max_kernel, g, b, 0, (hipStream_t)stream, scores, bsc, nkeys,
+                     sstride, bstride, nb_blocks, block, keys_all);
+  AFF_HIP_CHECK(hipGetLastError());
+}
+
+void idx_apply_cand_hip(float* scores, const uint8_t* cand, const uint32_t* nkeys, uint32_t nb,
+                        uint32_t sstride, uint32_t cstride, uint32_t keys_max, uint32_t block,
+                        uint32_t keys_all, void* stream) {
+  if (!nb || !keys_max || !block) return;
+  const dim3 g((keys_max + 255u) / 256u, nb), b(256);
+  hipLaunchKernelGGL(idx_apply_cand_kernel, g, b, 0, (hipStream_t)stream, scores, cand, nkeys,
+                     sstride, cstride, block, keys_all);
+  AFF_HIP_CHECK(hipGetLastError());
 }
 
 }  // namespace aff

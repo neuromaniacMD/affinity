@@ -111,4 +111,28 @@ void idx_topk_mask_hip(const float* scores, uint8_t* mask, const uint32_t* nkeys
 // engine still builds on the host.
 void idx_encode_rows(const float* src, uint8_t* dst, float* scale, uint32_t n, uint32_t dim);
 
+// ---- V4.1's candidate pre-filter --------------------------------------------------------------
+//
+// Level one of a two-level top-k (`select_candidate_blocks`, model.py:583). The candidate SOURCE
+// layer scores blocks of `block` compressed positions by their best position and keeps the best
+// `topk_blocks` of them; the index sources after it may only select inside that set.
+//
+// ⚠️ This is a CORRECTNESS feature, not a speed one. Every index source still scores every key —
+// the plane is unchanged — and what the filter restricts is the CHOICE the top-k then makes. It is
+// also a no-op below `topk_blocks * block` positions (16,384 on the shipped config), where every
+// block is kept, so nothing about a short or medium context moves.
+//
+// `bsc` is [nb][bstride] f32, the block scores. `nkeys` is the per-token key count (null = `keys_all`
+// for every token). The block holding a token's newest position comes back +inf, pinned the way the
+// reference pins it. The top-k over `bsc` is `idx_topk_mask_hip` — the same select, one level up.
+void idx_block_max_hip(const float* scores, float* bsc, const uint32_t* nkeys, uint32_t nb,
+                       uint32_t sstride, uint32_t bstride, uint32_t nb_blocks, uint32_t block,
+                       uint32_t keys_all, void* stream);
+
+// Everything outside the published set to -inf, in place, before this layer's own top-k runs.
+// `keys_max` bounds the launch; each token is still cut at its own `nkeys`.
+void idx_apply_cand_hip(float* scores, const uint8_t* cand, const uint32_t* nkeys, uint32_t nb,
+                        uint32_t sstride, uint32_t cstride, uint32_t keys_max, uint32_t block,
+                        uint32_t keys_all, void* stream);
+
 }  // namespace aff

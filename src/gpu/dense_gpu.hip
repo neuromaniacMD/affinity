@@ -347,6 +347,12 @@ struct DenseGpu::Impl {
     float*   a_q = nullptr;      // a_hpr heads
     float*   a_out = nullptr;    // a_hpr heads
     uint8_t* a_allow = nullptr;
+    // V4.1's candidate blocks, published by one layer and read by the index sources after it. One
+    // BYTE a block, not a bit: the produce side is `idx_topk_mask_hip`, which writes a byte mask,
+    // and reusing that select verbatim is worth more than the 8x. Decode holds one token's worth.
+    uint8_t* a_cand = nullptr;
+    float*   i_bsc = nullptr;                             // the block scores it selects over
+    uint32_t* i_ncb = nullptr; uint32_t* hi_ncb = nullptr;  // per-token block counts
 
     // ---- small f32 vectors and the router gate --------------------------------------------------
     // The vectors are replicated (norm weights, hyper-connection scales — a few KiB each).
@@ -432,6 +438,7 @@ struct DenseGpu::Impl {
     const float* q8_src = nullptr;                        // which plane the slot holds, or null
     float* h_tm = nullptr;                                // pinned, b_mid_ * b_cap_ floats
     uint8_t* b_allow = nullptr;                           // device, the same plane
+    uint8_t* b_cand = nullptr;                            // the chunk's candidate blocks
     // ---- THE FOUR STAGING RINGS -----------------------------------------------------------------
     //
     // Every H2D on the hot path whose source the host rewrites. See StageRing for why each is a ring
@@ -2247,6 +2254,8 @@ void DenseGpu::hc_seed(const float* embed, uint32_t n_embd, uint32_t n_hc) {
   // A new token: a_allow/a_adm/a_admn hold the PREVIOUS token's admissions. indexer_one re-arms
   // this per layer when the indexer engages; without it a stale layer match reads old admissions.
   a_idx_layer_[slot_] = -1;
+  // ...and the same for the candidate blocks, which are per token for exactly the same reason.
+  a_cand_src_[slot_] = -1;
   if (!hc_ok_) return;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
@@ -3393,7 +3402,7 @@ bool DenseGpu::draft_init(uint32_t n_embd, uint32_t tap_in, uint32_t vocab, uint
 // arguments the run can present makes every later call a no-op rather than a resize.
 bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_t width,
                                uint32_t idx_dim, uint32_t idx_heads, std::string* err,
-                               const uint8_t* key_layers) {
+                               const uint8_t* key_layers, uint32_t cand_block) {
   if (!impl_ || impl_->dev.empty()) { if (err) *err = "no device"; return false; }
   if (!attn_ok_) { if (err) *err = "attn_init must run first"; return false; }
   if (!ratios) { if (err) *err = "no per-layer ratios"; return false; }
@@ -3436,6 +3445,22 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
     if (idx_heads && !idx_grow(&D, cap, idx_heads, idx_dim)) {
       if (err) *err = "indexer query and score planes";
       return false;
+    }
+    // ---- V4.1's candidate blocks ---------------------------------------------------------------
+    //
+    // Sized here for the same reason everything else in this function is: it is a function of the
+    // cache CAPACITY, and anything allocated after StaticPlacement is invisible to the decision it
+    // makes about how many expert shards fit. One byte a block a token — at the shipped block of 8
+    // that is an eighth of what the admission mask beside it costs.
+    if (cand_block) {
+      cand_block_ = cand_block;
+      cand_blocks_cap_ = (a_maxcomp_ + cand_block - 1u) / cand_block;
+      const size_t bc = cand_blocks_cap_ ? cand_blocks_cap_ : 1u;
+      if (!hip_try(hipMalloc(&D.a_cand, bc), "candidate blocks (decode)", err)) return false;
+      if (!hip_try(hipMalloc(&D.i_bsc, (size_t)i_tile_ * bc * sizeof(float)), "block scores", err))
+        return false;
+      if (b_cap_ && !hip_try(hipMalloc(&D.b_cand, (size_t)b_cap_ * bc), "candidate blocks", err))
+        return false;
     }
     // The flash key split. kSplitTok is the launch size above which the natural grid already fills
     // the device, so the arena never has to hold a prefill chunk: at 32 heads a card and 512 dims a
@@ -3582,6 +3607,7 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
   // A new chunk: whatever admissions the b_* buffers hold were written for a previous chunk's
   // token count and are garbage past it. batch_indexer re-arms this for its own layer.
   b_idx_layer_[slot_] = -1;
+  b_cand_src_[slot_] = -1;
   // The SAME function batch_init sized the arena with, deliberately. As a second copy of the
   // expression it drifted: a chunk asked for a stride larger than its own arena, was refused here,
   // and the caller quietly fell back to one token at a time — so prefill reported decode's rate,
@@ -3889,7 +3915,8 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
   if (D.i_cap_tok >= n) return true;
   const uint32_t cap = n;
   for (void** p : {(void**)&D.i_q, (void**)&D.i_q8, (void**)&D.i_qs, (void**)&D.i_w,
-                   (void**)&D.i_sc, (void**)&D.hi_w, (void**)&D.i_nc, (void**)&D.hi_nc})
+                   (void**)&D.i_sc, (void**)&D.hi_w, (void**)&D.i_nc, (void**)&D.hi_nc,
+                   (void**)&D.i_ncb, (void**)&D.hi_ncb})
     if (*p) { (void)hipFree(*p); *p = nullptr; }
   if (hipMalloc(&D.i_q, (size_t)cap * n_head * dim * sizeof(float)) != hipSuccess) return false;
   if (hipMalloc(&D.i_q8, (size_t)cap * n_head * dim) != hipSuccess) return false;
@@ -3908,6 +3935,10 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
     return false;
   if (hipMalloc(&D.i_nc, (size_t)cap * sizeof(uint32_t)) != hipSuccess) return false;
   if (hipHostMalloc((void**)&D.hi_nc, (size_t)cap * sizeof(uint32_t)) != hipSuccess) return false;
+  // The same counts in BLOCKS, for the candidate pre-filter's select. Allocated whether or not the
+  // model has one: two arrays of `cap` uint32 against branching this function on a config value.
+  if (hipMalloc(&D.i_ncb, (size_t)cap * sizeof(uint32_t)) != hipSuccess) return false;
+  if (hipHostMalloc((void**)&D.hi_ncb, (size_t)cap * sizeof(uint32_t)) != hipSuccess) return false;
   D.i_cap_tok = cap;
   return true;
 }
@@ -4474,6 +4505,19 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
 // The lightning indexer for one token. Same five kernels the batched path runs, with n = 1 and the
 // mask landing in `a_allow`, which is where attn_run reads it — so nothing crosses the bus and the
 // host never sees a score.
+// Says ONCE, on stderr, that the candidate pre-filter has started doing something. It is a no-op
+// below `candidate_topk_blocks * candidate_block_size` positions — every block is kept — and that
+// threshold is 16,384 here, well past where anything else in this engine changes behaviour. Without
+// a line to point at, "the filter is live" and "the filter is configured but idle" look the same
+// from outside, and the difference is the whole question when a long-context answer moves.
+void DenseGpu::cand_note(uint32_t layer, uint32_t keys, uint32_t nblk, uint32_t topk_blocks) {
+  if (cand_noted_ || nblk <= topk_blocks) return;         // idle: the select keeps every block
+  cand_noted_ = true;
+  aff::ui::err("candidate pre-filter: ACTIVE from layer %u — %u compressed rows in %u blocks, "
+               "keeping %u (%.1f%%)\n", layer, keys, nblk, topk_blocks,
+               100.0 * (double)topk_blocks / (double)nblk);
+}
+
 bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
   const uint32_t layer = a.layer, n_head = a.n_head, topk = a.topk;
   if (!attn_ok_ || a.h_wq_b < 0 || (size_t)a.h_wq_b >= ent_.size() || a.dim != kIdxDim ||
@@ -4514,6 +4558,29 @@ bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
     idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head * a.dim, st);
     indexer_scores_hip(D.i_q8, D.i_qs, D.a_idx8_s[slot_][kl], D.a_idxs_s[slot_][kl], D.i_w, D.i_sc, 1, a.n_keys,
                        n_head, st);
+    // ---- the candidate pre-filter, both levels -------------------------------------------------
+    //
+    // The SOURCE publishes from its own unmasked scores and then takes its own top-k over those
+    // same unmasked scores — the reference's `if is_candidate_source: ... elif uses_candidates:`,
+    // which is an either/or and never both. A layer BEFORE the source does neither.
+    if (cand_block_ && a.cand_source >= 0 && D.a_cand) {
+      const uint32_t nblk = (a.n_keys + cand_block_ - 1u) / cand_block_;
+      if (nblk > cand_blocks_cap_) return false;
+      if ((int64_t)layer > (int64_t)a.cand_source) {
+        // Level two. Only inside what the source published — and only if it actually published for
+        // THIS token: a stale set from the previous one would be a plausible wrong answer.
+        if (a_cand_src_[slot_] != (int64_t)a.cand_source) return false;
+        idx_apply_cand_hip(D.i_sc, D.a_cand, nullptr, 1, a_maxcomp_, cand_blocks_cap_, a.n_keys,
+                           cand_block_, a.n_keys, st);
+      } else if (layer == (uint32_t)a.cand_source) {
+        // Level one, into the byte mask the layers after this one read.
+        cand_note(layer, a.n_keys, nblk, a.cand_topk_blocks);
+        idx_block_max_hip(D.i_sc, D.i_bsc, nullptr, 1, a_maxcomp_, cand_blocks_cap_, nblk,
+                          cand_block_, a.n_keys, st);
+        idx_topk_mask_hip(D.i_bsc, D.a_cand, nullptr, 1, cand_blocks_cap_, cand_blocks_cap_, nblk,
+                          a.cand_topk_blocks, st);
+      }
+    }
     // Null counts: at one token the score row IS its own prefix. The clear is over `n_mask`, the
     // attention's own row count for this token, and NOT over the plane's pitch: the pitch comes
     // from the cache's capacity, so at a 1M cache it is 262146 bytes however short the context is.
@@ -4522,6 +4589,7 @@ bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
                       a.n_mask > a_maxcomp_ ? a_maxcomp_ : a.n_mask, topk, st, &D.topk,
                       gather ? D.a_adm : nullptr, gather ? D.a_admn : nullptr, kAdmCap);
   }
+  if (cand_block_ && a.cand_source >= 0 && layer == (uint32_t)a.cand_source) a_cand_src_[slot_] = (int64_t)a.cand_source;
   // Stamped with the layer that OWNS these admissions, which on V4.1 is the index source and on
   // V4 is `layer` itself — attend() asks idxl(), so the layers between sources match too.
   a_idx_layer_[slot_] = (int64_t)idxl(layer);
@@ -4574,6 +4642,15 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
     std::memcpy(D.hi_nc, n_comp, (size_t)n * sizeof(uint32_t));
     AFF_HIP_CHECK(hipMemcpyAsync(D.i_nc, D.hi_nc, (size_t)n * sizeof(uint32_t),
                                  hipMemcpyHostToDevice, st));
+    // The same prefix in BLOCKS, which is what the candidate select's per-token count has to be:
+    // ceil, so the partly-filled block holding a token's newest position is INSIDE its own count —
+    // that block is the one the reference pins, and a floor here would put it out of reach.
+    if (cand_block_ && a.cand_source >= 0) {
+      for (uint32_t t = 0; t < n; ++t)
+        D.hi_ncb[t] = (n_comp[t] + cand_block_ - 1u) / cand_block_;
+      AFF_HIP_CHECK(hipMemcpyAsync(D.i_ncb, D.hi_ncb, (size_t)n * sizeof(uint32_t),
+                                   hipMemcpyHostToDevice, st));
+    }
     // RoPE and QAT here, not on the host: i_q holds the projection's RAW output, and i_w the head
     // weights — batch_indexer_q and batch_compress wrote both, on device.
     idx_rope_qat_hip(D.i_q, n, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
@@ -4593,6 +4670,25 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
       indexer_scores_hip(D.i_q8 + (size_t)t0 * n_head * a.dim, D.i_qs + t0, D.a_idx8_s[slot_][kl],
                          D.a_idxs_s[slot_][kl], D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys,
                          n_head, st);
+      // The candidate pre-filter, per tile. The mask is indexed by the CHUNK's own token number, so
+      // a tile writes and reads its own slice of it and the tiling cannot move a block — the same
+      // argument as the score plane above. See indexer_one for which layer does which level.
+      if (cand_block_ && a.cand_source >= 0 && D.b_cand) {
+        uint8_t* cand = D.b_cand + (size_t)t0 * cand_blocks_cap_;
+        const uint32_t nblk = (n_keys + cand_block_ - 1u) / cand_block_;
+        if (nblk > cand_blocks_cap_) return false;
+        if ((int64_t)layer > (int64_t)a.cand_source) {
+          if (b_cand_src_[slot_] != (int64_t)a.cand_source) return false;
+          idx_apply_cand_hip(D.i_sc, cand, D.i_nc + t0, nt, a_maxcomp_, cand_blocks_cap_, n_keys,
+                             cand_block_, n_keys, st);
+        } else if (layer == (uint32_t)a.cand_source) {
+          cand_note(layer, n_keys, nblk, a.cand_topk_blocks);
+          idx_block_max_hip(D.i_sc, D.i_bsc, D.i_nc + t0, nt, a_maxcomp_, cand_blocks_cap_, nblk,
+                            cand_block_, n_keys, st);
+          idx_topk_mask_hip(D.i_bsc, cand, D.i_ncb + t0, nt, cand_blocks_cap_, cand_blocks_cap_,
+                            nblk, a.cand_topk_blocks, st);
+        }
+      }
       // Straight into b_allow at the CHUNK's own token indexing; batch_attend then offsets by its
       // sub-batch. The mask never leaves the card.
       const bool gather = topk <= kAdmCap;
@@ -4602,6 +4698,8 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
                         gather ? D.b_admn + t0 : nullptr, kAdmCap);
     }
   }
+  if (cand_block_ && a.cand_source >= 0 && layer == (uint32_t)a.cand_source)
+    b_cand_src_[slot_] = (int64_t)a.cand_source;
   // The index source that OWNS these admissions — see indexer_one for why the stamp is the owner
   // and not the caller.
   b_idx_layer_[slot_] = (int64_t)idxl(layer);

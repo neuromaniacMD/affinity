@@ -170,7 +170,7 @@ public:
   // same set.
   bool reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_t width, uint32_t idx_dim,
                        uint32_t idx_heads, std::string* err,
-                       const uint8_t* key_layers = nullptr);
+                       const uint8_t* key_layers = nullptr, uint32_t cand_block = 0);
 
   // ---- attention state, resident in VRAM ------------------------------------------------------
   // Per layer and bounded: `sliding` raw rows in a ring (attention is over a SET, so ring order is
@@ -464,6 +464,13 @@ private:
   // `a_idx_layer_` guard has to ask who owns it rather than who is asking.
   // Empty means "every layer runs its own", i.e. V4, where this is the identity.
   std::vector<uint32_t> idx_owner_;
+  // V4.1's candidate pre-filter. `cand_block_` 0 means the model has none and every path below is
+  // skipped; `cand_blocks_cap_` is the cache capacity in blocks, which is what the buffers are
+  // sized by. See gpu/indexer_gpu.h — it restricts what the top-k may CHOOSE, not what is scored.
+  uint32_t cand_block_ = 0, cand_blocks_cap_ = 0;
+  bool     cand_noted_ = false;
+  // One stderr line the first time the filter actually selects rather than keeping everything.
+  void     cand_note(uint32_t layer, uint32_t keys, uint32_t nblk, uint32_t topk_blocks);
   bool shift_pre_ = false;
   uint32_t kvl(uint32_t l) const { return l < kv_owner_.size() ? kv_owner_[l] : l; }
   uint32_t idxl(uint32_t l) const { return l < idx_owner_.size() ? idx_owner_[l] : l; }
@@ -514,6 +521,7 @@ private:
   void init_slot_keys() {
     for (uint32_t i = 0; i < kMaxSlots; ++i) {
       a_idx_layer_[i] = -1; b_idx_layer_[i] = -1;
+      a_cand_src_[i] = -1;  b_cand_src_[i] = -1;
       a_idx_gather_[i] = false; a_idx_topk_[i] = 0;
     }
   }
@@ -524,6 +532,11 @@ private:
   int64_t  a_idx_layer_[kMaxSlots];  // the layer whose admissions a_allow/a_adm hold, for the
                                      // CURRENT decode token only; hc_seed invalidates it
   int64_t  b_idx_layer_[kMaxSlots];  // batch twin: the layer whose admissions b_allow/b_adm/b_admn
+  // Which layer published the candidates now in a_cand/b_cand, or -1. Same guard shape as the two
+  // above: a consumer that finds nothing published refuses rather than reading a set belonging to
+  // another token or another chunk.
+  int64_t  a_cand_src_[kMaxSlots];
+  int64_t  b_cand_src_[kMaxSlots];
                                      // hold, for the CURRENT chunk only; batch_begin invalidates it.
                                      // One shared key let a stale layer match hand batch_attend
                                      // counts written for a DIFFERENT chunk length — slots past that

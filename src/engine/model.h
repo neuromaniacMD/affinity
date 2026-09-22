@@ -319,6 +319,11 @@ public:
   // The comparison is only honest if both sides are lowered together — `ref_forward.py` takes the
   // matching --index-topk.
   void set_index_topk(uint32_t k) { index_topk_override_ = k; }
+  // The candidate pre-filter's block budget, same oracle role: the shipped 2048 blocks of 8 keep
+  // EVERY block below 16,384 compressed positions, so level two of the two-level top-k does not
+  // change an answer at any context short enough to iterate on. Lowering it moves the same code
+  // path into range.
+  void set_candidate_topk_blocks(uint32_t b) { cand_topk_override_ = b; }
   void set_max_layers(uint32_t n) { max_layers_ = n; }
 
   void init_state(SeqState* s, uint64_t max_pos) const;
@@ -391,6 +396,12 @@ public:
     // quantised independently and their scores mean nothing outside a shared basis. V4 rotates
     // both, V4.1 neither. See gpu/indexer_gpu.h.
     bool     hadamard = true;
+    // ---- the candidate pre-filter (V4.1) ---------------------------------------------------
+    // The layer that PUBLISHES the candidate blocks, or -1 to disable the whole thing. The device
+    // decides its own role from it: equal means publish, greater means select inside what was
+    // published, less means neither (layers 2, 8 and 14 run before the source and are untouched).
+    int32_t  cand_source = -1;
+    uint32_t cand_topk_blocks = 0, cand_block = 0;
   };
 
   // Device execution of the dense path. Registered before load() so the loader can hand every
@@ -969,6 +980,7 @@ private:
   // layer -> the index-source layer whose top-k it reads. V4.1 only; identity on V4, where every
   // indexed layer runs its own indexer.
   std::vector<uint32_t> idx_owner_;
+  uint32_t cand_topk_override_ = 0;
   DenseW hc_head_fn_;
   const float* hc_head_base_ = nullptr;
   const float* hc_head_scale_ = nullptr;

@@ -333,7 +333,7 @@ int main(int argc, char** argv) {
   std::string logits_out;
   // Oracle knobs, for tools/ref_forward.py: at the shipped index_topk the lightning indexer needs
   // ~2048 positions and all 43 layers before it engages. See Model::set_index_topk.
-  uint32_t index_topk = 0, max_layers = 0;
+  uint32_t index_topk = 0, max_layers = 0, cand_topk_blocks = 0;
   bool dump_tokens = false;
   // Tokens per batched-prefill chunk; 0 disables the batched path. Rounded up to a multiple of 128.
   //
@@ -436,6 +436,8 @@ int main(int argc, char** argv) {
     else if (a == "--prefix-cache-verify") pcache_verify = true;
     else if (a == "--logits-out") logits_out = nxt();
     else if (a == "--index-topk") index_topk = (uint32_t)std::strtoul(nxt(), nullptr, 10);
+    else if (a == "--candidate-topk-blocks")
+      cand_topk_blocks = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--max-layers") max_layers = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--dump-tokens") dump_tokens = true;
     else if (a == "--no-echo") echo_prompt = false;
@@ -646,6 +648,12 @@ int main(int argc, char** argv) {
         "                              different tok/s for reasons unrelated to either.\n"
         "      --no-routed-experts     zero the routed experts to isolate the dense path. THE\n"
         "                              OUTPUT IS NOT THE MODEL'S — most of the FFN is gone.\n"
+        "      --candidate-topk-blocks B  override the candidate pre-filter's block budget. Oracle\n"
+        "                              use only, and the same reason as --index-topk: the shipped\n"
+        "                              2048 blocks of 8 keep EVERY block below 16,384 compressed\n"
+        "                              positions, so nothing short enough to iterate on exercises\n"
+        "                              level two at all. Lowering it moves the same code path into\n"
+        "                              range. 0 leaves the container's value alone.\n"
         "      --index-topk K          override the indexer's top-k. Oracle use only: the shipped\n"
         "                              512 needs ~2048 positions before the indexer engages, which\n"
         "                              no numpy reference reaches. Pass the same K to\n"
@@ -705,6 +713,7 @@ int main(int argc, char** argv) {
   }
   Model model;
   if (index_topk) model.set_index_topk(index_topk);
+  if (cand_topk_blocks) model.set_candidate_topk_blocks(cand_topk_blocks);
   if (max_layers) model.set_max_layers(max_layers);
 #ifdef AFF_WITH_HIP
   // Dense goes to VRAM first; placement sizes the expert slabs from what is left. Reversed,
@@ -998,7 +1007,8 @@ int main(int argc, char** argv) {
     }
     std::string rerr;
     if (!dense_gpu.reserve_runtime(c.n_layer, ratios.data(), c.head_dim, c.index_head_dim,
-                                   c.index_n_heads, &rerr, c.v41 ? key_layers.data() : nullptr))
+                                   c.index_n_heads, &rerr, c.v41 ? key_layers.data() : nullptr,
+                                   c.v41 && c.candidate_source_layer >= 0 ? c.candidate_block : 0u))
       aff::ui::out("runtime reservation: %s — expert placement will over-commit\n", rerr.c_str());
     vram.mark("compressor + indexer");
 
