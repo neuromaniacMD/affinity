@@ -607,8 +607,9 @@ bool Model::load_dspark(const std::string& path, std::string* err) {
   {
     const std::pair<const void*, const char*> required[] = {
       {d.main_proj.data, "mtp_main_proj"}, {d.main_norm, "mtp_main_norm"}, {d.norm, "mtp_norm"},
-      {d.hc_head_fn.data, "mtp_hc_head_fn"}, {d.hc_head_base, "mtp_hc_head_base"},
-      {d.hc_head_scale, "mtp_hc_head_scale"},
+      {cfg_.v41 ? (const void*)1 : d.hc_head_fn.data, "mtp_hc_head_fn"},
+      {cfg_.v41 ? (const void*)1 : d.hc_head_base, "mtp_hc_head_base"},
+      {cfg_.v41 ? (const void*)1 : d.hc_head_scale, "mtp_hc_head_scale"},
       {d.markov_w1.data, "mtp_markov_w1"}, {d.markov_w2.data, "mtp_markov_w2"},
       {d.confidence, "mtp_confidence"},
     };
@@ -2042,7 +2043,10 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
   const AttnConfig ac = cfg_.attn();
   const uint32_t W = ac.qk_width(), ROT = cfg_.rope_dim;
   const uint32_t QR = cfg_.q_lora_rank, OR = cfg_.o_lora_rank;
-  const uint32_t NE = cfg_.n_expert, KS = cfg_.n_expert_used;
+  // The draft's own pool, which V4.1 sizes below the target's (128 of 384, 3 active of 6). V4's
+  // draft shares the target's counts, and dspark_n_expert is 0 there, so this is the same value.
+  const uint32_t NE = cfg_.dspark_n_expert ? cfg_.dspark_n_expert : cfg_.n_expert;
+  const uint32_t KS = cfg_.dspark_n_expert_used ? cfg_.dspark_n_expert_used : cfg_.n_expert_used;
   const uint32_t NS = (uint32_t)D.stage.size(), B = cfg_.dspark_block;
   const uint32_t P = s->pos;                       // the block's first position
   if (!P || !B) return false;
@@ -2175,14 +2179,25 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
   // the accept rule is `draft[j] == argmax(target[j])`, so a draft whose last bits moved proposes a
   // different token and the target either agrees with it or does not. Only acceptance moves, and
   // acceptance is a property of the prompt to begin with.
-  if (!bops_.draft_collapse || D.hc_head_fn.gpu < 0 || D.hc_head_scale_gpu < 0 ||
-      D.hc_head_base_gpu < 0 || D.norm_gpu < 0) {
-    aff::ui::fatal("fatal: the draft's head collapse is not bound on the device\n");
-    std::abort();
+  // `DSparkBlock.forward_head` collapses with `pre_mix` exactly as the model's head does, so on
+  // V4.1 the draft has no head mixer either and reuses what its last stage's FFN computed.
+  if (cfg_.v41) {
+    if (!bops_.collapse_pre || D.norm_gpu < 0) {
+      aff::ui::fatal("fatal: the v4.1 draft head needs collapse_pre and its norm on the device "
+                     "(norm handle %d)\n", D.norm_gpu);
+      std::abort();
+    }
+    if (!bops_.collapse_pre(bops_.ctx, D.norm_gpu, E, HC, cfg_.hc_eps, cfg_.rms_eps)) return false;
+  } else {
+    if (!bops_.draft_collapse || D.hc_head_fn.gpu < 0 || D.hc_head_scale_gpu < 0 ||
+        D.hc_head_base_gpu < 0 || D.norm_gpu < 0) {
+      aff::ui::fatal("fatal: the draft's head collapse is not bound on the device\n");
+      std::abort();
+    }
+    if (!bops_.draft_collapse(bops_.ctx, D.hc_head_fn.gpu, D.hc_head_scale_gpu, D.hc_head_base_gpu,
+                              D.norm_gpu, E, HC, cfg_.hc_eps, cfg_.rms_eps))
+      return false;
   }
-  if (!bops_.draft_collapse(bops_.ctx, D.hc_head_fn.gpu, D.hc_head_scale_gpu, D.hc_head_base_gpu,
-                            D.norm_gpu, E, HC, cfg_.hc_eps, cfg_.rms_eps))
-    return false;
   AFF_PH(draft_ep);
   if (!bops_.draft_head(bops_.ctx, head_.gpu, cfg_.vocab, E, B, nullptr, D.markov_w1.gpu,
                         D.markov_w2.gpu, cfg_.dspark_markov_rank, first_id, out))
