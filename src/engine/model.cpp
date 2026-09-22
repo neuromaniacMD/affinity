@@ -570,6 +570,10 @@ void Model::init_state(SeqState* s, uint64_t max_pos) const {
   s->layer.assign(cfg_.n_layer, LayerState{});
   s->hc.assign((size_t)cfg_.hc_mult * cfg_.n_embd, 0.0f);
   s->pos = 0;
+  // amdnas-fixes init-state compress_reset: the device-side compressor/indexer history rings were never cleared between
+  // requests (the op existed, nothing called it). A request's first `hist` positions pool over slots the previous request's
+  // tail wrote; if one of those rows went bad, every later request inherits it. Clear them with the host state.
+  if (bops_.compress_reset && bops_.ctx) (void)bops_.compress_reset(bops_.ctx);
   for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
     const uint32_t ratio = cfg_.ratio_for(l);
     if (ratio) s->layer[l].comp_rows = max_pos / ratio + 2;
