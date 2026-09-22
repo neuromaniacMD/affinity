@@ -9,6 +9,7 @@
 #include <thread>
 
 #include <sys/mman.h>
+#include <cstdlib>
 #include <unistd.h>
 
 namespace aff {
@@ -190,8 +191,14 @@ bool HostExpertPool::init(const AffReader* aff, uint64_t budget_bytes, Wanted wa
   // THE PAGE SIZE OF THIS POOL DOES NOT MATTER — see `thp_bytes` and the note on the madvise below.
   alloc_bytes_ = (n_pool + n_stage_) * out_stride_;
   stage0_ = n_pool;
+  // amdnas-fixes thp-first: populate AFTER the hugepage hint so the pool is registered with the GPU on 2 MiB pages.
+  // A 4 KiB-page mapping of tens of GiB costs the card ~8 B/page of VRAM page tables (taken after the slab was sized) and
+  // khugepaged then collapses the pages under a live GPU mapping; both ended in stale/invalid GPU PTEs = garbage or a
+  // permission fault from the expert GEMM. AFF_POOL_THP=0 restores the upstream order.
+  const char* thp_env = std::getenv("AFF_POOL_THP");
+  const bool thp_first = !(thp_env && thp_env[0] == '0');
   void* p = ::mmap(nullptr, alloc_bytes_, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+                   MAP_PRIVATE | MAP_ANONYMOUS | (thp_first ? 0 : MAP_POPULATE), -1, 0);
   if (p == MAP_FAILED) {
     // Not fatal: without a pool every non-resident expert simply falls to the SSD tier, which is
     // slower but correct. Saying so beats aborting a load that can still run.
@@ -211,6 +218,18 @@ bool HostExpertPool::init(const AffReader* aff, uint64_t budget_bytes, Wanted wa
   // the expert path is COMPUTE-bound, far from memory per core, so a TLB miss it never waits on
   // cannot cost anything. The hint stays only because it is free where it is.
   (void)::madvise(base_, alloc_bytes_, MADV_HUGEPAGE);
+  if (thp_first) {
+    const auto tp0 = std::chrono::steady_clock::now();
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+    if (::madvise(base_, alloc_bytes_, MADV_POPULATE_WRITE) != 0) {
+      for (uint64_t o = 0; o < alloc_bytes_; o += (2u << 20)) base_[o] = 0;   // one touch a 2 MiB page
+    }
+    aff::ui::err("host pool: hugepage-first populate of %.1f GiB in %.1f s (amdnas-fixes thp-first; AFF_POOL_THP=0 to disable)\n",
+                 (double)alloc_bytes_ / (1 << 30),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count());
+  }
 
   const auto t0 = std::chrono::steady_clock::now();
   {
