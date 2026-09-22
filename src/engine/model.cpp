@@ -897,8 +897,10 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     // decode has to use it too — a host-side pool here would run over a state that prefill stopped
     // updating. Both halves move together: the indexer's keys are the compressor's output.
     const bool has_idx = w.ratio == 4 && w.idx_comp_wkv && w.idx_comp_wgate && w.idx_proj;
+    // `comp_wgate` is not required: V4.1's ratio-1 layers pool a single position and ship no gate,
+    // and the device compressor takes h_sc = -1 for that (DenseW leaves .gpu at -1 when unbound).
     const bool dev_comp = dops_.compress_one && dops_.indexer_one && w.ratio && w.comp_wkv &&
-                          w.comp_wgate && dev_hc;
+                          (w.comp_wgate || cfg_.v41) && dev_hc;
     const bool dev_index = dev_comp && has_idx && want_qrnorm && st.n_comp;
     if (dops_.want_qrn_dev) dops_.want_qrn_dev(dops_.ctx, dev_index);
 
@@ -1475,7 +1477,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // per-token prefix of it that attention needs. The ratio-128 HCA layers go the same way; they
       // simply have no indexer half, so their pool is one window instead of two.
       const bool has_idx = w.ratio == 4 && w.idx_comp_wkv && w.idx_comp_wgate;
-      const bool dev_comp = bops_.compress && w.ratio && w.comp_wkv && w.comp_wgate;
+      const bool dev_comp = bops_.compress && w.ratio && w.comp_wkv && (w.comp_wgate || cfg_.v41);
       uint32_t n_out = 0;
       if (w.ratio) {
         const uint64_t cap = st.comp_rows;

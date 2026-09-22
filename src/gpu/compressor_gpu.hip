@@ -66,15 +66,23 @@ __global__ void compress_kernel(Window win, const float* __restrict__ ape,
   //
   // The ape row index is the position's own `pos % ratio`, which for both windows is exactly the
   // loop counter: pe ≡ ratio-1, so (pe - 2*ratio + 1 + r) and (pe - ratio + 1 + r) are both ≡ r.
+  // V4.1 brings two shapes V4 never had: no `ape` at all (null here), and ratio 1, where a group is
+  // ONE position and the layer has no gate projection. The softmax over a single candidate is 1
+  // whatever the score, so `gated` false weights every candidate equally instead of reading a score
+  // buffer that does not exist — which would be an uninitialised load, not a harmless wrong weight.
+  const bool gated = win.sc != nullptr;
   const bool paired = ratio == 4u;
   const int64_t p0 = pe - (int64_t)(ratio - 1u);
+  auto score = [&](const float* b, uint32_t c, uint32_t r) -> float {
+    return (gated ? b[c] : 0.0f) + (ape ? ape[(size_t)r * width + c] : 0.0f);
+  };
   float m = -1e30f;
   for (uint32_t r = 0; r < ratio; ++r) {
     const float *a = nullptr, *b = nullptr;
     if (paired && win.at(p0 - (int64_t)ratio + r, &a, &b))
-      m = fmaxf(m, b[j] + ape[(size_t)r * width + j]);
+      m = fmaxf(m, score(b, j, r));
     if (win.at(p0 + r, &a, &b))
-      m = fmaxf(m, b[hd * (paired ? 1u : 0u) + j] + ape[(size_t)r * width + hd * (paired ? 1u : 0u) + j]);
+      m = fmaxf(m, score(b, hd * (paired ? 1u : 0u) + j, r));
   }
   float pooled = 0.0f;
   if (m > -5e29f) {
@@ -82,12 +90,12 @@ __global__ void compress_kernel(Window win, const float* __restrict__ ape,
     for (uint32_t r = 0; r < ratio; ++r) {
       const float *a = nullptr, *b = nullptr;
       if (paired && win.at(p0 - (int64_t)ratio + r, &a, &b)) {
-        const float wp = expf(b[j] + ape[(size_t)r * width + j] - m);
+        const float wp = expf(score(b, j, r) - m);
         den += wp; sum += wp * a[j];
       }
       if (win.at(p0 + r, &a, &b)) {
         const uint32_t c = hd * (paired ? 1u : 0u) + j;
-        const float wc = expf(b[c] + ape[(size_t)r * width + c] - m);
+        const float wc = expf(score(b, c, r) - m);
         den += wc; sum += wc * a[c];
       }
     }

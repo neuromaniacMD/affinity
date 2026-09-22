@@ -3906,7 +3906,10 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
 
 bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
   if (!b_nb_ || !a.n || !a.ratio || (a.ratio & (a.ratio - 1u)) || !attn_ok_) return false;
-  if (a.h_kv < 0 || a.h_sc < 0) return false;
+  if (a.h_kv < 0) return false;
+  // V4.1's ratio-1 layers have no gate projection: one position a group, so the pool IS the
+  // projection. Everything below that touches the score half is conditioned on this.
+  const bool gated = a.h_sc >= 0;
   const bool has_idx = a.h_ikv >= 0 && a.h_isc >= 0;      // ratio 4 only
   if (has_idx && a.idx_dim != kIdxDim) return false;
   if (a.layer >= impl_->dev[0].a_comp_s[slot_].size()) return false;
@@ -3953,30 +3956,41 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
     //
     // Async on the layer's own stream needs no sync: the kernels that read these are issued on `st`
     // behind them, and the sources are the model's own weights, which outlive the process.
-    if (!D.c_ape[a.layer]) {
-      const size_t ab = (size_t)a.ratio * cw * sizeof(float);
-      if (hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
+    //
+    // Keyed on `c_norm`, not on `c_ape`: V4.1 has no ape, so an ape-keyed guard would never latch
+    // and every chunk would allocate and copy the norm again.
+    if (!D.c_norm[a.layer]) {
       if (hipMalloc(&D.c_norm[a.layer], (size_t)a.width * sizeof(float)) != hipSuccess) return false;
-      AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
       AFF_HIP_CHECK(hipMemcpyAsync(D.c_norm[a.layer], a.norm, (size_t)a.width * sizeof(float),
                                    hipMemcpyHostToDevice, st));
+      if (a.ape) {
+        const size_t ab = (size_t)a.ratio * cw * sizeof(float);
+        if (hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
+        AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
+      }
       if (has_idx) {
-        const size_t iab = (size_t)a.ratio * iw * sizeof(float);
-        if (hipMalloc(&D.ci_ape[a.layer], iab) != hipSuccess) return false;
         if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
           return false;
-        AFF_HIP_CHECK(hipMemcpyAsync(D.ci_ape[a.layer], a.iape, iab, hipMemcpyHostToDevice, st));
         AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.inorm,
                                      (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
+        if (a.iape) {
+          const size_t iab = (size_t)a.ratio * iw * sizeof(float);
+          if (hipMalloc(&D.ci_ape[a.layer], iab) != hipSuccess) return false;
+          AFF_HIP_CHECK(hipMemcpyAsync(D.ci_ape[a.layer], a.iape, iab, hipMemcpyHostToDevice, st));
+        }
       }
     }
 
     // GEMMs into one dim-major staging block, then transposes: the pool indexes by POSITION, so it
     // wants token-major, and the transpose is the same one batch_indexer_q uses.
     struct Job { int32_t h; uint32_t rows; float* dst; };
-    Job job[4] = {{a.h_kv, cw, D.c_kv}, {a.h_sc, cw, D.c_sc},
-                  {a.h_ikv, iw, D.ci_kv}, {a.h_isc, iw, D.ci_sc}};
-    const int nj = has_idx ? 4 : 2;
+    // The gate half is skipped entirely when the layer has none (V4.1 ratio 1), so the list is
+    // built rather than indexed: an empty slot in the middle would shift every later offset.
+    Job job[4];
+    int nj = 0;
+    job[nj++] = {a.h_kv, cw, D.c_kv};
+    if (gated) job[nj++] = {a.h_sc, cw, D.c_sc};
+    if (has_idx) { job[nj++] = {a.h_ikv, iw, D.ci_kv}; job[nj++] = {a.h_isc, iw, D.ci_sc}; }
     // ONE launch when they agree on a format, which they do — all four are the same container's
     // compressor tensors. Four small GEMMs against one activation is exactly the shape that reads
     // well under its streaming rate apart and at the ceiling fused.
@@ -4021,7 +4035,7 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
 
     if (a.n_out) {
       CompressJob c{};
-      c.kv = D.c_kv; c.sc = D.c_sc;
+      c.kv = D.c_kv; c.sc = gated ? D.c_sc : nullptr;   // null sc = weight every candidate equally
       c.hist_kv = D.c_hkv_s[slot_][a.layer]; c.hist_sc = D.c_hsc_s[slot_][a.layer];
       c.ape = D.c_ape[a.layer]; c.norm = D.c_norm[a.layer];
       c.out = D.a_comp_s[slot_][a.layer];
@@ -4061,7 +4075,8 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
 // into the kernel with no transpose.
 bool DenseGpu::compress_one(const Model::CompressArgs& a) {
   if (!a.ratio || (a.ratio & (a.ratio - 1u)) || !attn_ok_ || a.n != 1u) return false;
-  if (a.h_kv < 0 || a.h_sc < 0) return false;
+  if (a.h_kv < 0) return false;
+  const bool gated = a.h_sc >= 0;       // V4.1 ratio 1 has no gate — see batch_compress
   const bool has_idx = a.h_ikv >= 0 && a.h_isc >= 0;
   if (has_idx && a.idx_dim != kIdxDim) return false;
   if (a.layer >= impl_->dev[0].a_comp_s[slot_].size()) return false;
@@ -4084,21 +4099,28 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
     if (!compress_grow(&D, a.layer, a.ratio, cw, iw)) return false;
     if (2u * (uint64_t)(cw + iw) + a.idx_heads > D.cap_mid) return false;
     // Same lazy upload as the batched path above, same reason for being async — see there.
-    if (!D.c_ape[a.layer]) {
-      const size_t ab = (size_t)a.ratio * cw * sizeof(float);
-      if (hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
+    //
+    // Keyed on `c_norm`, not on `c_ape`: V4.1 has no ape, so an ape-keyed guard would never latch
+    // and every chunk would allocate and copy the norm again.
+    if (!D.c_norm[a.layer]) {
       if (hipMalloc(&D.c_norm[a.layer], (size_t)a.width * sizeof(float)) != hipSuccess) return false;
-      AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
       AFF_HIP_CHECK(hipMemcpyAsync(D.c_norm[a.layer], a.norm, (size_t)a.width * sizeof(float),
                                    hipMemcpyHostToDevice, st));
+      if (a.ape) {
+        const size_t ab = (size_t)a.ratio * cw * sizeof(float);
+        if (hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
+        AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
+      }
       if (has_idx) {
-        const size_t iab = (size_t)a.ratio * iw * sizeof(float);
-        if (hipMalloc(&D.ci_ape[a.layer], iab) != hipSuccess) return false;
         if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
           return false;
-        AFF_HIP_CHECK(hipMemcpyAsync(D.ci_ape[a.layer], a.iape, iab, hipMemcpyHostToDevice, st));
         AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.inorm,
                                      (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
+        if (a.iape) {
+          const size_t iab = (size_t)a.ratio * iw * sizeof(float);
+          if (hipMalloc(&D.ci_ape[a.layer], iab) != hipSuccess) return false;
+          AFF_HIP_CHECK(hipMemcpyAsync(D.ci_ape[a.layer], a.iape, iab, hipMemcpyHostToDevice, st));
+        }
       }
     }
     // ---- buffer `norm`, project the whole group at the pool -------------------------------------
@@ -4199,9 +4221,13 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
     if (a.n_out || D.c_np[a.layer] >= cap) {
       const uint32_t nb = D.c_np[a.layer], pos0 = D.c_ppos0[a.layer];
       struct Job { int32_t h; uint32_t rows; float* dst; };
-      Job job[4] = {{a.h_kv, cw, D.c_kv}, {a.h_sc, cw, D.c_sc},
-                    {a.h_ikv, iw, D.ci_kv}, {a.h_isc, iw, D.ci_sc}};
-      const int nj = has_idx ? 4 : 2;
+      // Built, not indexed — see the batched path: a layer with no gate has no score projection and
+      // a hole in the middle would shift every later offset into the staging block.
+      Job job[4];
+      int nj = 0;
+      job[nj++] = {a.h_kv, cw, D.c_kv};
+      if (gated) job[nj++] = {a.h_sc, cw, D.c_sc};
+      if (has_idx) { job[nj++] = {a.h_ikv, iw, D.ci_kv}; job[nj++] = {a.h_isc, iw, D.ci_sc}; }
       bool done = false;
       if (tmaj) {
         // One launch for the whole flush, writing the pool's layout directly: no GEMM, no
@@ -4239,7 +4265,7 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
 
       if (a.n_out) {
         CompressJob c{};
-        c.kv = D.c_kv; c.sc = D.c_sc;
+        c.kv = D.c_kv; c.sc = gated ? D.c_sc : nullptr;
         c.hist_kv = D.c_hkv_s[slot_][a.layer]; c.hist_sc = D.c_hsc_s[slot_][a.layer];
         c.ape = D.c_ape[a.layer]; c.norm = D.c_norm[a.layer];
         c.out = D.a_comp_s[slot_][a.layer];
