@@ -19,6 +19,8 @@
 #include "ui/log.h"
 #include <hip/hip_fp16.h>
 
+#include <string>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -917,6 +919,7 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
       return -1;
     }
     if (hipMalloc(&s.data, nbytes) != hipSuccess) return -1;
+    s.data_bytes = nbytes;   // amdnas-fixes weight-verify
     if (s.ncols == cols) {
       // Row and Rep: the slice is contiguous in the container's row-major layout.
       AFF_HIP_CHECK(hipMemcpy(s.data, (const uint8_t*)host + s.row0 * cols * elem, nbytes,
@@ -930,6 +933,7 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
     }
     if (sc_bytes) {
       if (hipMalloc((void**)&s.scales, sc_bytes) != hipSuccess) return -1;
+      s.scales_bytes = sc_bytes;   // amdnas-fixes weight-verify
       if (sh_sc_cols == sc_cols) {
         AFF_HIP_CHECK(hipMemcpy(s.scales, scales + (s.row0 / 128) * sc_cols, sc_bytes,
                                 hipMemcpyHostToDevice));
@@ -5718,3 +5722,52 @@ std::vector<GpuDeviceDesc> gpu_devices() {
 }
 
 } // namespace aff
+
+// ---- amdnas-fixes weight-verify -------------------------------------------------------------------------------------
+namespace {
+uint64_t aff_wv_hash(const uint8_t* p, size_t n, uint64_t h) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t w; std::memcpy(&w, p + i, 8);
+    h ^= w; h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29;
+  }
+  for (; i < n; ++i) { h ^= p[i]; h *= 0x100000001B3ull; }
+  return h;
+}
+uint64_t aff_wv_digest_dev(const void* dptr, uint64_t bytes, std::vector<uint8_t>& stage) {
+  uint64_t h = 0xCBF29CE484222325ull;
+  const size_t chunk = 64u << 20;
+  if (stage.size() < chunk) stage.resize(chunk);
+  for (uint64_t off = 0; off < bytes; off += chunk) {
+    const size_t n = (size_t)std::min<uint64_t>(chunk, bytes - off);
+    if (hipMemcpy(stage.data(), (const uint8_t*)dptr + off, n, hipMemcpyDeviceToHost) != hipSuccess) return 0xDEADull;
+    h = aff_wv_hash(stage.data(), n, h);
+  }
+  return h;
+}
+}  // namespace
+
+uint64_t aff::DenseGpu::digest_weights(std::vector<std::pair<std::string, uint64_t>>* out) const {
+  if (!impl_) return 0;
+  int prev = 0; (void)hipGetDevice(&prev);
+  static std::vector<uint8_t> stage;
+  uint64_t total = 0;
+  for (size_t i = 0; i < ent_.size(); ++i) {
+    const Entry& e = ent_[i];
+    for (size_t d = 0; d < impl_->dev.size() && d < kMaxRanks; ++d) {
+      const Shard& sh = e.sh[d];
+      if (!sh.data || !sh.data_bytes) continue;
+      (void)hipSetDevice(impl_->dev[d].id);
+      out->emplace_back("ent" + std::to_string(i) + " rank" + std::to_string(d) + " data",
+                        aff_wv_digest_dev(sh.data, sh.data_bytes, stage));
+      total += sh.data_bytes;
+      if (sh.scales && sh.scales_bytes) {
+        out->emplace_back("ent" + std::to_string(i) + " rank" + std::to_string(d) + " scales",
+                          aff_wv_digest_dev(sh.scales, sh.scales_bytes, stage));
+        total += sh.scales_bytes;
+      }
+    }
+  }
+  (void)hipSetDevice(prev);
+  return total;
+}

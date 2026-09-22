@@ -958,6 +958,8 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     // the free VRAM the load banner reports, which is why that banner is printed on every run.
     AFF_HIP_CHECK(hipMalloc(&I.slab[i], (per_gpu[i] + shadow_slots_) * slot_stride + 4096));
     AFF_HIP_CHECK(hipMalloc(&I.d_cb[i], cb_bytes));
+    slab_alloc_bytes_.push_back((per_gpu[i] + shadow_slots_) * slot_stride + 4096);   // amdnas-fixes weight-verify
+    cb_bytes_ = cb_bytes;
     AFF_HIP_CHECK(hipMemcpy(I.d_cb[i], cb_src, cb_bytes, hipMemcpyHostToDevice));
     AFF_HIP_CHECK(hipStreamCreate(&I.stream[i]));
   }
@@ -2566,6 +2568,8 @@ void aff::StaticPlacement::verify_plc(const char* tag) const {
     for (size_t i = 0; i < n; ++i)
       if (dtab[i] != htab[i]) bad.push_back(i);
     ++plc_checks_;
+    if (plc_checks_ <= plc_.size())
+      aff::ui::err("plc-verify [%s]: card %zu first check, %zu words, %zu differ before sync\n", tag, dv, n, bad.size());
     if (bad.empty()) continue;
     (void)hipSetDevice(devs_[dv]);
     (void)hipDeviceSynchronize();
@@ -2597,4 +2601,47 @@ void aff::StaticPlacement::verify_plc(const char* tag) const {
       aff::ui::err("PLC-MISMATCH [%s] card %zu: %zu of %zu entries differ after a device sync (check #%llu)\n", tag, dv,
                    persistent, n, (unsigned long long)plc_checks_);
   }
+}
+
+// ---- amdnas-fixes weight-verify -------------------------------------------------------------------------------------
+namespace {
+uint64_t aff_sp_hash(const uint8_t* p, size_t n, uint64_t h) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t w; std::memcpy(&w, p + i, 8);
+    h ^= w; h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29;
+  }
+  for (; i < n; ++i) { h ^= p[i]; h *= 0x100000001B3ull; }
+  return h;
+}
+}  // namespace
+
+uint64_t aff::StaticPlacement::digest_invariants(std::vector<std::pair<std::string, uint64_t>>* out) const {
+  if (!impl_) return 0;
+  int prev = 0; (void)hipGetDevice(&prev);
+  std::vector<uint8_t> buf;
+  uint64_t total = 0;
+  for (size_t dv = 0; dv < devs_.size(); ++dv) {
+    (void)hipSetDevice(devs_[dv]);
+    if (dv < impl_->d_cb.size() && impl_->d_cb[dv] && cb_bytes_) {
+      buf.resize(cb_bytes_);
+      uint64_t h = 0xCBF29CE484222325ull;
+      if (hipMemcpy(buf.data(), impl_->d_cb[dv], cb_bytes_, hipMemcpyDeviceToHost) == hipSuccess)
+        h = aff_sp_hash(buf.data(), cb_bytes_, h);
+      else h = 0xDEADull;
+      out->emplace_back("codebook card" + std::to_string(dv), h);
+      total += cb_bytes_;
+    }
+    if (dv < impl_->slab.size() && impl_->slab[dv] && dv < slab_alloc_bytes_.size() && slab_alloc_bytes_[dv] >= 4096) {
+      buf.resize(4096);
+      uint64_t h = 0xCBF29CE484222325ull;
+      if (hipMemcpy(buf.data(), impl_->slab[dv] + slab_alloc_bytes_[dv] - 4096, 4096, hipMemcpyDeviceToHost) == hipSuccess)
+        h = aff_sp_hash(buf.data(), 4096, h);
+      else h = 0xDEADull;
+      out->emplace_back("slab-tail-pad card" + std::to_string(dv), h);
+      total += 4096;
+    }
+  }
+  (void)hipSetDevice(prev);
+  return total;
 }

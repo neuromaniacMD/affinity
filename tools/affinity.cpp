@@ -2209,6 +2209,35 @@ int main(int argc, char** argv) {
   // server exists to be driven by agents), and a random seed per request so two identical requests
   // are two samples rather than one answer twice.
   srv.set_slots(kSlots);
+  // amdnas-fixes weight-verify (AFF_WEIGHT_VERIFY=1): hash the read-only device state before each chat request and
+  // compare it with the first result. A WEIGHT-MISMATCH names what changed; a clean line is the positive evidence.
+  std::vector<std::pair<std::string, uint64_t>> wv_base;
+  std::mutex wv_mu;
+  auto weight_verify = [&](const char* tag) {
+    static const bool on = std::getenv("AFF_WEIGHT_VERIFY") != nullptr;
+    if (!on) return;
+    std::lock_guard<std::mutex> lk(wv_mu);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::pair<std::string, uint64_t>> cur;
+    uint64_t bytes = dense_gpu.digest_weights(&cur);
+    bytes += placement.digest_invariants(&cur);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (wv_base.empty()) {
+      wv_base = cur;
+      aff::ui::err("weight-verify [%s]: baseline %zu regions, %.2f GiB hashed in %.0f ms\n", tag, cur.size(),
+                   (double)bytes / 1073741824.0, ms);
+      return;
+    }
+    size_t bad = 0;
+    for (size_t i = 0; i < cur.size() && i < wv_base.size(); ++i)
+      if (cur[i].second != wv_base[i].second || cur[i].first != wv_base[i].first) {
+        ++bad;
+        aff::ui::err("WEIGHT-MISMATCH [%s]: %s hash 0x%016llx was 0x%016llx\n", tag, cur[i].first.c_str(),
+                     (unsigned long long)cur[i].second, (unsigned long long)wv_base[i].second);
+      }
+    if (cur.size() != wv_base.size()) ++bad;
+    aff::ui::err("weight-verify [%s]: %zu regions, %zu changed, %.0f ms\n", tag, cur.size(), bad, ms);
+  };
   const bool ok = srv.start(host, port, [&](const CompletionRequest& req, const TokenSink& sink,
                                             GenResult* res, uint32_t slot) {
     std::vector<ChatMsg> msgs;
@@ -2324,6 +2353,7 @@ int main(int argc, char** argv) {
 
     SeqState st;
     // The budget covers the whole generation, so it is also exactly what the state has to hold.
+    weight_verify("pre-request");   // amdnas-fixes weight-verify
     model.init_state(&st, ids.size() + total_budget + 8);
     std::vector<float> logits;
     std::vector<uint32_t> hist = ids;

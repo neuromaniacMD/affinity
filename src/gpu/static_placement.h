@@ -249,6 +249,10 @@ public:
   void engine_report() const;
   // amdnas-fixes plc-verify: compare the device placement table with plc_host_ (AFF_PLC_VERIFY=N ticks).
   void verify_plc(const char* tag) const;
+  // amdnas-fixes weight-verify: hash each card's codebook and the 4096-byte pad past the end of its slab.
+  uint64_t digest_invariants(std::vector<std::pair<std::string, uint64_t>>* out) const;
+  std::vector<uint64_t> slab_alloc_bytes_;   // per card, what hipMalloc was asked for (slots + pad)
+  uint64_t cb_bytes_ = 0;
   mutable uint64_t plc_checks_ = 0, plc_bad_ = 0;
 
   // The cards this placement actually uses. Every one of them needs a keepalive heartbeat, and this

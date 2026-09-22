@@ -44,6 +44,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <utility>
 
 namespace aff {
 
@@ -79,6 +80,9 @@ public:
   // Brings up one rank per gfx12 device found, or `want_ranks` of them when that is smaller.
   // Returns false — having allocated nothing — when there is no supported device at all.
   bool init(uint64_t max_rows, uint64_t max_cols, std::string* err, size_t want_ranks = 0);
+  // amdnas-fixes weight-verify: hash every uploaded shard (data + scales) on every rank. Appends
+  // ("ent<i> rank<d> data|scales", hash) pairs; returns the bytes hashed.
+  uint64_t digest_weights(std::vector<std::pair<std::string, uint64_t>>* out) const;
 
   // The hook the model binds to. Pass `ops()` to Model::set_dense_ops BEFORE Model::load.
   Model::DenseOps ops();
@@ -301,6 +305,7 @@ private:
     // `data` is in WMMA fragment order, not row-major. Only the W8A8 GEMM can read it; every other
     // reader is a wrong answer that still decodes fluently, so they abort instead.
     bool     ps = false;
+    uint64_t data_bytes = 0, scales_bytes = 0;   // amdnas-fixes weight-verify: sizes for the read-back digest
   };
   struct Entry {
     Shard sh[kMaxRanks];
