@@ -102,6 +102,68 @@ bool parse_model_config(const std::string& j, ModelConfig* c, std::string* err) 
     std::fprintf(stderr, "config: dspark_target_layer_ids was not ascending; sorted to match the "
                          "reference's concatenation order\n");
   }
+  // ---- DeepSeek-V4.1 --------------------------------------------------------------------------
+  //
+  // Keyed off the architecture, not off any single field: a V4 config that happened to gain one of
+  // these keys must not switch the whole attention schedule. ⚠️ The flat scan takes the FIRST match,
+  // and a V4.1 config carries a `vision_config` with its own `hidden_size` / `num_hidden_layers` /
+  // `num_attention_heads` — it sits after `text_config`, which is why the values above are the text
+  // model's. Anything read here that also exists under vision must be read the same way.
+  c->v41 = j.find("\"deepseek_v41") != std::string::npos;
+  if (c->v41) {
+    // V4.1 has no hash-routed layers and no `num_hash_layers` key; the V4 default of 3 would send
+    // three layers down a path whose table the container does not even hold.
+    if (!get_u32(j, "num_hash_layers", &c->n_hash_layer)) c->n_hash_layer = 0;
+    get_u32(j, "o_groups", &c->o_groups);
+    int_array("kv_source_layer_ids", &c->kv_source_layers);
+    int_array("index_source_layer_ids", &c->index_source_layers);
+    int32_t cand = -1;
+    if (const char* p = find_key(j, "candidate_source_layer_id")) cand = (int32_t)std::strtol(p, nullptr, 10);
+    c->candidate_source_layer = cand;
+    get_u32(j, "candidate_topk_blocks", &c->candidate_topk_blocks);
+    get_u32(j, "candidate_block_size", &c->candidate_block);
+    int_array("engram_layer_ids", &c->engram_layers);
+    {   // row counts are ~384 million each, so they do not fit the int32 array reader
+      std::vector<int32_t> tmp;
+      const char* p = find_key(j, "engram_num_embeddings");
+      if (p) {
+        while (*p && *p != '[') ++p;
+        if (*p == '[') {
+          ++p;
+          c->engram_rows.clear();
+          while (*p && *p != ']') {
+            while (*p == ' ' || *p == ',' || *p == '\n') ++p;
+            if (*p == ']' || !*p) break;
+            c->engram_rows.push_back(std::strtoull(p, (char**)&p, 10));
+          }
+        }
+      }
+      (void)tmp;
+    }
+    get_u32(j, "engram_max_ngram_size", &c->engram_max_ngram);
+    get_u32(j, "engram_vocab_size", &c->engram_vocab);
+    get_u32(j, "engram_n_heads", &c->engram_n_heads);
+    get_u32(j, "engram_head_dim", &c->engram_head_dim);
+    get_u32(j, "engram_pad_token_id", &c->engram_pad_token);
+    get_u32(j, "engram_compressed_vocab_size", &c->engram_compressed_vocab);
+    get_f32(j, "gate_temp", &c->gate_temp);
+    get_u32(j, "dspark_n_routed_experts", &c->dspark_n_expert);
+    get_u32(j, "dspark_num_experts_per_tok", &c->dspark_n_expert_used);
+    if (const char* p = find_key(j, "scoring_func")) {
+      while (*p == ' ' || *p == '"') ++p;
+      c->score_func = std::strncmp(p, "sqrtsoftplus", 12) == 0 ? ModelConfig::ScoreFunc::SqrtSoftplus
+                    : std::strncmp(p, "softmax", 7) == 0       ? ModelConfig::ScoreFunc::Softmax
+                                                               : ModelConfig::ScoreFunc::Sigmoid;
+    }
+    if (c->kv_source_layers.empty() || c->index_source_layers.empty()) {
+      if (err) *err = "v4.1 config without kv_source_layer_ids / index_source_layer_ids";
+      return false;
+    }
+    if (c->engram_layers.size() != c->engram_rows.size()) {
+      if (err) *err = "engram_layer_ids and engram_num_embeddings disagree in length";
+      return false;
+    }
+  }
   if (c->n_layer == 0 || c->n_embd == 0) {
     if (err) *err = "config missing num_hidden_layers / hidden_size";
     return false;

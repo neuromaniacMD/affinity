@@ -65,10 +65,59 @@ struct ModelConfig {
   uint32_t dspark_markov_rank = 256;
   std::vector<int32_t> dspark_taps;
 
+  // ---- DeepSeek-V4.1 (`model_type` `deepseek_v41`) --------------------------------------------
+  //
+  // Same block shape, different attention schedule. V4 gave every compressing layer its own
+  // compressor and indexer; V4.1 names SOURCE layers: a kv-source layer builds the compressed KV
+  // and the indexer keys, an index-source layer builds the top-k, and the layers between reuse
+  // them (`SharedAttentionRuntime` in the reference). `compress_ratios` are 1 and 2 here, not
+  // 4 and 128, so `ratio == 4` no longer means "indexed" — ask `is_index_source`.
+  bool     v41 = false;
+  uint32_t o_groups = 8;                  // wo_a is block-diagonal over this many groups
+  std::vector<int32_t> kv_source_layers;      // build compressed KV + indexer keys
+  std::vector<int32_t> index_source_layers;   // build the indexer top-k
+  // Candidate pre-filter: one source layer scores blocks of `candidate_block` positions and keeps
+  // `candidate_topk_blocks` of them; < 0 disables it and the other two are unused.
+  int32_t  candidate_source_layer = -1;
+  uint32_t candidate_topk_blocks = 0;
+  uint32_t candidate_block = 0;
+  // Engram: n-gram hash lookups added to the residual stream between layers. The tables are ~95 GiB
+  // each and stay in the CHECKPOINT (the container holds only q/k/wkv), so `engram_rows` is what a
+  // loader needs to find them.
+  std::vector<int32_t>  engram_layers;
+  std::vector<uint64_t> engram_rows;
+  uint32_t engram_max_ngram = 0;
+  uint32_t engram_vocab = 0;              // bucket count each (n-gram size, head) searches primes from
+  uint32_t engram_n_heads = 0;
+  uint32_t engram_head_dim = 0;
+  uint32_t engram_pad_token = 2;
+  uint32_t engram_compressed_vocab = 0;
+  // Routing. V4 was sigmoid + a token-id hash table on layers 0-2; V4.1 is sqrt-softplus with no
+  // hash layers, and carries a SECOND selection bias used inside image spans.
+  enum class ScoreFunc : uint8_t { Sigmoid, Softmax, SqrtSoftplus };
+  ScoreFunc score_func = ScoreFunc::Sigmoid;
+  float     gate_temp = 1.0f;
+  // The draft's own expert pool, which V4.1 sizes below the target's (128 of 384, 3 active).
+  uint32_t dspark_n_expert = 0;
+  uint32_t dspark_n_expert_used = 0;
+
   uint32_t ratio_for(uint32_t layer) const {
     return layer < compress_ratios.size() ? (uint32_t)compress_ratios[layer] : 0u;
   }
   bool uses_hash_routing(uint32_t layer) const { return layer < n_hash_layer; }
+  static bool in_list(const std::vector<int32_t>& v, uint32_t l) {
+    for (int32_t x : v) if ((uint32_t)x == l) return true;
+    return false;
+  }
+  // V4 has no source layers, so every compressing layer is its own source and the V4 paths below
+  // keep behaving exactly as they did.
+  bool is_kv_source(uint32_t layer) const {
+    return v41 ? in_list(kv_source_layers, layer) : ratio_for(layer) != 0;
+  }
+  bool is_index_source(uint32_t layer) const {
+    return v41 ? in_list(index_source_layers, layer) : ratio_for(layer) == 4;
+  }
+  bool is_engram_layer(uint32_t layer) const { return in_list(engram_layers, layer); }
   // head_dim in the config is the FULL latent width (512); AttnConfig splits it into the
   // unrotated lead and the rotated tail.
   AttnConfig attn() const {
@@ -120,6 +169,18 @@ struct LayerWeights {
   DenseW idx_comp_wgate ;
   const float*    idx_comp_ape = nullptr;
   const float*    idx_comp_norm = nullptr;
+  // V4.1 only. The indexer's keys come from the layer's own projection rather than a second
+  // compressor, and only kv-source layers have them; `idx_wq_b`/`idx_proj` sit on the (larger)
+  // set of index-source layers.
+  DenseW idx_wk ;
+  const float*    idx_k_norm = nullptr;
+  // The routing bias used inside image spans. Null on a text-only load and on V4.
+  const float*    router_b_vl = nullptr;
+  // Engram, on `engram_layers` only: q/k are [hc_mult, n_embd] mixes and wkv projects the looked-up
+  // n-gram rows. The TABLE itself is not in the container.
+  DenseW engram_wkv ;
+  const float*    engram_q = nullptr;
+  const float*    engram_k = nullptr;
 
   // Shared expert — dense, runs on every token alongside the routed six.
   DenseW shexp_gate ;

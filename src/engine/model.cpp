@@ -422,9 +422,47 @@ bool Model::load(const std::string& aff_path, std::string* err) {
       w.rope.freq_base = cfg_.rope_theta;
     }
 
+    // V4.1: the indexer keys come from the layer's own projection (kv-source layers only), the
+    // routing gains an image-span bias, and two layers carry the Engram projections. All optional
+    // per layer — the checks below are what make "absent where it should be present" fatal.
+    if (cfg_.v41) {
+      w.idx_wk      = b.dense(p + "idx_wk");
+      w.idx_k_norm  = b.f32(p + "idx_k_norm");
+      w.router_b_vl = b.f32(p + "ffn_gate_bias_vl");
+      w.engram_wkv  = b.dense(p + "engram_wkv");
+      w.engram_q    = b.f32(p + "engram_q");
+      w.engram_k    = b.f32(p + "engram_k");
+    }
+
     // Missing weights must fail the load, not degrade the output — see the note on the same check
     // over the dense weights above.
-    {
+    if (cfg_.v41) {
+      // A compressing layer that is NOT a kv source is legal here and carries no compressor: it
+      // reads the source layer's compressed KV. `wgate` follows ratio 2 (the ratio-1 source has
+      // none), so it is required only where the checkpoint put it.
+      if (cfg_.is_kv_source(l) && (!w.comp_wkv || !w.comp_norm || !w.idx_wk || !w.idx_k_norm)) {
+        if (err) *err = "layer " + std::to_string(l) + " is a kv-source layer with no compressor / indexer keys";
+        return false;
+      }
+      if (cfg_.is_index_source(l) && (!w.idx_wq_b || !w.idx_proj)) {
+        if (err) *err = "layer " + std::to_string(l) + " is an index-source layer with no indexer queries";
+        return false;
+      }
+      if (cfg_.is_engram_layer(l) && (!w.engram_wkv || !w.engram_q || !w.engram_k)) {
+        if (err) *err = "layer " + std::to_string(l) + " is an engram layer with no engram weights";
+        return false;
+      }
+      if (!w.router_b) {
+        if (err) *err = "layer " + std::to_string(l) + " is missing ffn_gate_bias";
+        return false;
+      }
+      // Present in every shipped V4.1 layer. Missing, the router would silently use the text bias
+      // inside image spans — invisible in a text-only run and wrong in a VL one.
+      if (!w.router_b_vl) {
+        if (err) *err = "layer " + std::to_string(l) + " is missing ffn_gate_bias_vl";
+        return false;
+      }
+    } else {
       if (w.ratio && (!w.comp_wkv || !w.comp_wgate || !w.comp_ape || !w.comp_norm)) {
         if (err) *err = "layer " + std::to_string(l) + " has ratio " + std::to_string(w.ratio) +
                         " but no compressor weights";
