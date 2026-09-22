@@ -199,3 +199,22 @@ private:
 };
 
 } // namespace aff
+
+// ---- amdnas-fixes malloc-trace --------------------------------------------------------------------------------------
+// Every device allocation in src/gpu goes through here (this header is included by all of them, and the macro below
+// rewrites the call sites). A failed hipMalloc is the one silent, VRAM-gated, permanent failure mode left after probes
+// 8-15; it is logged with its site. AFF_MALLOC_TRACE=1 also logs successes >= 1 MiB.
+inline hipError_t aff_hipMalloc_dbg(void** p, size_t n, const char* file, int line) {
+  const hipError_t e = ::hipMalloc(p, n);
+  static const bool trace = std::getenv("AFF_MALLOC_TRACE") != nullptr;
+  int dev = -1; (void)hipGetDevice(&dev);
+  if (e != hipSuccess) {
+    size_t fb = 0, tb = 0; (void)hipMemGetInfo(&fb, &tb);
+    aff::ui::err("HIPMALLOC-FAIL %s:%d dev %d bytes %zu (%.1f MiB) free %.1f MiB: %s\n", file, line, dev, n,
+                 (double)n / 1048576.0, (double)fb / 1048576.0, hipGetErrorString(e));
+  } else if (trace && n >= (1u << 20)) {
+    aff::ui::err("hipmalloc %s:%d dev %d %.1f MiB -> %p\n", file, line, dev, (double)n / 1048576.0, *p);
+  }
+  return e;
+}
+#define hipMalloc(p, n) aff_hipMalloc_dbg((void**)(p), (n), __FILE__, __LINE__)
