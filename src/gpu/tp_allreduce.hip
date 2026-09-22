@@ -595,6 +595,7 @@ void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4
                        (hipStream_t)ctx.stream[r], (const float4*)in[r], push,
                        (const float4*)ctx.scratch[r], (float4*)out[r], ctx.flags[r], ctx.seq[r],
                        ctx.timeout_dev, n4, slot4, peer4, (int)r);
+    AFF_HIP_CHECK(hipGetLastError());
   }
 }
 
@@ -615,6 +616,7 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
                        (hipStream_t)ctx.stream[r], in[r], push,
                        (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
                        ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+    AFF_HIP_CHECK(hipGetLastError());
   }
 }
 
@@ -688,3 +690,5 @@ void tp_sync(TpContext& ctx) {
 }
 
 } // namespace aff
+
+// amdnas-fixes launch-check: every hipLaunchKernelGGL in this file is followed by a launch-error check (2026-09-22).

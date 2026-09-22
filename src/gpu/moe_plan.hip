@@ -392,7 +392,10 @@ bool plc_publish_hip(uint64_t* plc, const PlcPatch& p, void* stream) {
   if (!plc || p.n > kPlcPatchMax) return false;
   if (!p.n) return true;
   hipLaunchKernelGGL(plc_publish_kernel, dim3(1), dim3(kPlcPatchMax), 0, (hipStream_t)stream, plc, p);
-  return true;
+  // amdnas-fixes: a publish launch that never ran leaves the DEVICE table stale while the host bookkeeping
+  // (offset_of_, pool binding, free lists) advances — the freed slot is then handed to another expert and the table
+  // points two experts at one slot for the life of the process. The caller aborts on false; that is the right outcome.
+  return hipGetLastError() == hipSuccess;
 }
 
 size_t moe_plan_lds_bytes(uint32_t n_expert, uint32_t nb_tok) {
@@ -413,7 +416,9 @@ bool moe_plan_hip(const MoePlanArgs& a, void* stream) {
   const size_t lds = moe_plan_lds_bytes(a.n_expert, a.nb_tok);
   if (lds > device_lds_per_block()) return false;
   hipLaunchKernelGGL(moe_plan_kernel, dim3(1), dim3(kPlanThreads), lds, (hipStream_t)stream, a);
-  return true;
+  return hipGetLastError() == hipSuccess;   // amdnas-fixes: an unbuilt plan must not be dispatched
 }
 
 } // namespace aff
+
+// amdnas-fixes launch-check: every hipLaunchKernelGGL in this file is followed by a launch-error check (2026-09-22).

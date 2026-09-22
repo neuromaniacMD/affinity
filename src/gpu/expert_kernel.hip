@@ -1707,7 +1707,7 @@ bool expert_gemm_tokens_pair_hip(const DeviceMatrix& a, float* ya, const DeviceM
   const GemmJob j1 = b ? GemmJob{b->data, b->scales, b->rscales, yb} : j0;
   #define AFF_GEMM_T(TT) \
     hipLaunchKernelGGL(expert_gemm_tokens_kernel<TT>, dim3(blocks, b ? 2u : 1u), dim3(kThreads), \
-                       0, (hipStream_t)stream, j0, j1, cb, x, wscale, m.rows, m.cols)
+                       0, (hipStream_t)stream, j0, j1, cb, x, wscale, m.rows, m.cols); AFF_HIP_CHECK(hipGetLastError())
   switch (nt) {
     case 1:  AFF_GEMM_T(1);  break;
     case 2:  AFF_GEMM_T(2);  break;
@@ -2385,7 +2385,7 @@ bool matvec_multix_hip(const MvJob* jobs, uint32_t n_jobs, const float* x, uint3
 #define AFF_MULTIX(T)                                                                             \
   case T:                                                                                         \
     hipLaunchKernelGGL((matvec_multix_kernel<T>), dim3(blocks), dim3(kDenseThreads), 0,            \
-                       (hipStream_t)stream, a, x, x_stride);                                      \
+                       (hipStream_t)stream, a, x, x_stride); AFF_HIP_CHECK(hipGetLastError());                                      \
     break
   switch (nt) {
     AFF_MULTIX(1); AFF_MULTIX(2); AFF_MULTIX(3); AFF_MULTIX(4);
@@ -2512,7 +2512,7 @@ void matvec_fp8_rmsnorm_hip(const uint8_t* W, const uint8_t* S, const float* x, 
   const uint32_t sc = (cols + 127) / 128;
 #define AFF_MVRN(N)                                                                          \
   hipLaunchKernelGGL((matvec_fp8_rn_kernel<N>), dim3(blocks), dim3(kDenseThreads), 0,         \
-                     (hipStream_t)stream, W, S, x, nw, out, xn, rows, cols, sc, eps)
+                     (hipStream_t)stream, W, S, x, nw, out, xn, rows, cols, sc, eps); AFF_HIP_CHECK(hipGetLastError())
   if (rb == 1u) { AFF_MVRN(1); }
   else if (rb == 2u) { AFF_MVRN(2); }
   else if (rb == 4u) { AFF_MVRN(4); }
@@ -2594,7 +2594,7 @@ void expert_gemv_multix_hip(const DeviceMatrix* mats, const float* const* xs, co
       const uint32_t fmt = expert_wire_format();
 #define AFF_GTRX(FV)                                                                              \
   hipLaunchKernelGGL((expert_gemv_kernel_tr<FV>), dim3(blocks), dim3(kThreads), 0,                 \
-                     (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols)
+                     (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols); AFF_HIP_CHECK(hipGetLastError())
       if (fmt == kFmtQuad2S) { AFF_GTRX(kFmtQuad2S); }
       else if (fmt == kFmtQuad4S) { AFF_GTRX(kFmtQuad4S); }
       else if (fmt == kFmtQuad4) { AFF_GTRX(kFmtQuad4); }
@@ -2644,7 +2644,7 @@ bool expert_gemv_split_hip(const DeviceMatrix* mats, const float* const* xs, flo
     const uint32_t fmt = expert_wire_format();
 #define AFF_GSPL(FV, RV)                                                                          \
   hipLaunchKernelGGL((expert_gemv_kernel_tr_split<FV, RV>), dim3(blocks), dim3(kThreads), 0,       \
-                     (hipStream_t)stream, p, weights + off, n, cb, rows, cols)
+                     (hipStream_t)stream, p, weights + off, n, cb, rows, cols); AFF_HIP_CHECK(hipGetLastError())
 #define AFF_GSPR(FV)                                                                              \
   do { if (use_rb == 4u) { AFF_GSPL(FV, 4); }                                                     \
        else if (use_rb == 2u) { AFF_GSPL(FV, 2); }                                                \
@@ -2715,7 +2715,7 @@ void expert_gemv_batch_hip(const DeviceMatrix* mats, const float* weights, uint3
       const uint32_t fmt = expert_wire_format();
 #define AFF_GTR(FV)                                                                               \
   hipLaunchKernelGGL((expert_gemv_kernel_tr<FV>), dim3(blocks), dim3(kThreads), 0,                 \
-                     (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols)
+                     (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols); AFF_HIP_CHECK(hipGetLastError())
       if (fmt == kFmtQuad2S) { AFF_GTR(kFmtQuad2S); }
       else if (fmt == kFmtQuad4S) { AFF_GTR(kFmtQuad4S); }
       else if (fmt == kFmtQuad4) { AFF_GTR(kFmtQuad4); }
@@ -3025,10 +3025,12 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
   const uint32_t fmt = expert_wire_format();
   const bool tr = expert_planes_are_colgroup_major();
 #define AFF_EW1(NTV, MTV, FV, TRV)                                                                \
+  do {                                                                                             \
   hipLaunchKernelGGL((expert_gemm_wmma_kernel<NTV, MTV, FV, TRV>),                                 \
                      dim3((rows + kEWaves * MTV * 16 - 1) / (kEWaves * MTV * 16), n_tiles),        \
                      dim3(kEThreads), 0, (hipStream_t)stream, tiles, x8, xs, cb, wscale, rows,     \
-                     cols, y_bf16 ? 1 : 0)
+                     cols, y_bf16 ? 1 : 0); AFF_HIP_CHECK(hipGetLastError());                      \
+  } while (0)
 // The plane layout and the wire format are INDEPENDENT, and both `tr` branches carry every format
 // on purpose: dispatching `tr` first and falling through to kFmtPair16 would read the shipped
 // layout with the wrong decode — right size, in-bounds addresses, wrong weights.
@@ -3060,3 +3062,5 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
 }
 
 } // namespace aff
+
+// amdnas-fixes launch-check: every hipLaunchKernelGGL in this file is followed by a launch-error check (2026-09-22).

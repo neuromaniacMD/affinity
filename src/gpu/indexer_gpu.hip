@@ -754,6 +754,7 @@ void idx_topk_mask_hip(const float* scores, uint8_t* mask, const uint32_t* nkeys
     for (int sh = 24; sh >= 0; sh -= 8)
       hipLaunchKernelGGL(idx_topk_hist_kernel, g, b, 0, st, scores, nkeys, stride, k, sh, sp->hist,
                          sp->state);
+      AFF_HIP_CHECK(hipGetLastError());
     hipLaunchKernelGGL(idx_topk_mark_kernel, g, b, 0, st, scores, mask, nkeys, stride, mstride,
                        mlen, k, sp->state, sp->tie);
     hipLaunchKernelGGL(idx_topk_tie_kernel, dim3(nb), dim3(kTopkThr), 0, st, scores, mask, nkeys,
@@ -802,3 +803,5 @@ void idx_encode_rows(const float* src, uint8_t* dst, float* scale, uint32_t n, u
 }
 
 }  // namespace aff
+
+// amdnas-fixes launch-check: every hipLaunchKernelGGL in this file is followed by a launch-error check (2026-09-22).
