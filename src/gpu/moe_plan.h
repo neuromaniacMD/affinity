@@ -75,7 +75,10 @@ struct MoePlanStatus {
 // falls more than `kActSlots` behind loses records and `head - tail` says exactly how many. Heat's
 // ranking is insensitive to a small fraction of dropped records — but a ring that silently drops is
 // a lie, so the harness asserts the drop rate rather than trusting it.
-constexpr uint32_t kActExperts = 256;
+// 512, not the 256 V4 needed: V4.1 routes over 384 and the record is fixed-size, so a smaller one
+// makes moe_plan_hip REFUSE (it will not silently drop a model's experts out of the heat ranking).
+// The cost is the ring: kActSlots records of 4 bytes an expert, ~132 KiB a card at 512.
+constexpr uint32_t kActExperts = 512;
 constexpr uint32_t kActSlots = 64;
 
 struct ActRecord {
