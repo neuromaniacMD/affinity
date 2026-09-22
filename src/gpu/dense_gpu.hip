@@ -874,10 +874,15 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
   // FP8 carries one UE8M0 scale per 128x128 tile, so a split of either axis has to land on a tile
   // boundary or a shard reads a neighbour's scales. A Col split that cannot align is demoted to
   // Rep rather than refused: replication is always arithmetically correct, only redundant.
-  if (e.split == Split::Col && (cols % (kRowAlign * R)) != 0) {
+  //
+  // The boundary is the SCALE TILE. A shard that clears it but not the narrow GEMM's 256-column
+  // staging width (V4.1: 2304 halves to 1152) is handled by that kernel choosing its wide tile
+  // instead — see batch_gemm_fp8 — rather than by replicating the matrix.
+  constexpr uint64_t kColAlign = kRowAlign;         // the scale tile; the GEMM picks a tile that fits
+  if (e.split == Split::Col && (cols % (kColAlign * R)) != 0) {
     aff::ui::err("dense-gpu: %s has %llu columns, which do not split %zu ways on a %llu "
                  "boundary — replicating instead\n", name, (unsigned long long)cols, R,
-                 (unsigned long long)kRowAlign);
+                 (unsigned long long)kColAlign);
     e.split = Split::Rep;
   }
 

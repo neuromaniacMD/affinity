@@ -2925,7 +2925,14 @@ bool expert_shard_layout(const AffLayerDesc& L, uint32_t parts, ExpertShardLayou
     const uint64_t cs = (i == 2) ? cols / parts : cols;
     if (i == 2) {
       if (cols % ((uint64_t)kEK * parts)) return false;    // whole column GROUPS only
-      if (cs % 512) return false;                          // the gemv kernels' own requirement
+      // The shard's own width only has to be whole column groups: the colgroup-major kernels stage
+      // kEK columns an iteration and address the plane by group, so kEK is the unit. The old rule
+      // here was 512, which V4's 2048-wide intermediate met by accident and V4.1's 2304 does not
+      // (1152 at two ranks) -- it cost the whole TP=2 path on V4.1 for no kernel reason. The 2048
+      // rule in the TILE path is a different kernel, which the engine declines while its planes are
+      // colgroup-major. AFF_SLAB_VERIFY checks every shard against the container's row-major bytes
+      // on load, which is what makes relaxing this testable rather than hopeful.
+      if (cs % kEK) return false;
     } else {
       if (rows % parts) return false;
     }

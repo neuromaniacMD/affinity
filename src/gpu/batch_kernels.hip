@@ -2629,7 +2629,12 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
   // engine's two callers are a 1536-token prefill chunk and a <=8-token speculative batch, and
   // every intermediate instantiation is another copy of the K loop in the binary for a shape
   // nothing issues. See the NT comment on the kernel for what the narrow form is buying.
-  const bool narrow = nb <= wmma::kN;
+  // The narrow tile stages 256 columns and would run past the end of a matrix that is not a
+  // multiple of that — the same hazard the split-K note below describes, and it decodes fluently
+  // while being wrong. V4.1 produces such a shape the moment a 2304-wide intermediate is split two
+  // ways (1152), so a K that does not fit the narrow tile takes the wide kernel, whose unit is 64.
+  // Slower at small `nb`, correct at every width.
+  const bool narrow = nb <= wmma::kN && (cols % kFKNarrow) == 0;
   const uint32_t nt = narrow ? 1u : kFNTiles;
   const uint32_t fn = nt * 16u;
   // The M tile. Wide calls keep the 8-wave block they were tuned with; narrow ones want as many
