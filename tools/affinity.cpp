@@ -1798,6 +1798,21 @@ int main(int argc, char** argv) {
         aff::ui::fatal("fatal: the verify block refused %u tokens at %u\n", nd + 1, P);
         std::abort();
       }
+      // amdnas-fixes 2026-09-21: a sampled id outside the vocabulary must never reach the embedding lookup, the
+      // tokenizer or the KV (the sampler kernel's drift fallback could return 0xFFFFFFFF — see sampler_gpu.hip).
+      // Log loudly and clamp to the proposal (or 0) so the stream stays in range.
+      if (sc) {
+        for (uint32_t j = 0; j <= nd && j < vb.draws.size(); ++j) {
+          Model::PosDraw& d = vb.draws[j];
+          if (d.tok >= c.vocab || d.tok_excl >= c.vocab) {
+            aff::ui::err("SAMPLER OOB: slot %u P=%u j=%u tok=%u tok_excl=%u p_query=%.4f (vocab %u, temp %.2f top_p %.2f)\n",
+                         slot, P, j, d.tok, d.tok_excl, d.p_query, (unsigned)c.vocab, vb.temperature, vb.top_p);
+            const uint32_t safe = (j < nd && fed[j + 1] < c.vocab) ? fed[j + 1] : 0u;
+            if (d.tok >= c.vocab) d.tok = safe;
+            if (d.tok_excl >= c.vocab) d.tok_excl = safe;
+          }
+        }
+      }
       // ---- how far the block is accepted ---------------------------------------------------------
       //
       // Greedy: the longest prefix the target would have produced itself, which makes the whole

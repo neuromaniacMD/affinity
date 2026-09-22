@@ -238,10 +238,14 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
     if (!(total > 0.0f)) return 0u;
     const float want = uu * total;
     float mine = 0.0f;
+    // amdnas-fixes 2026-09-21: remember the highest kept id in THIS slice so a drift miss below can fall back to the
+    // highest kept id in the whole block rather than to 0xFFFFFFFF (see the fallback after the slice walk).
+    int32_t my_last = -1;
     for (uint32_t v = lo; v < hi; ++v) {
       const float p = prob(v);
       if (!keep(p) || v == excl) continue;
       mine += p;
+      my_last = (int32_t)v;
     }
     sh.red[tid] = mine;
     __syncthreads();
@@ -272,6 +276,20 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       if (sh.pick == 0xFFFFFFFFu) sh.pick = last;
     }
     __syncthreads();
+    // amdnas-fixes 2026-09-21 (BUG): `keep_total` is a STRIDED sum and the slices are CONTIGUOUS sums, so with a flat
+    // distribution `want` can exceed the sum of every slice. The walk above then falls to slice kThr-1 — the top of the
+    // vocabulary, the special-token region that top_p filters out — which holds no kept token, `last` stays 0xFFFFFFFF
+    // and the kernel returned an OUT-OF-RANGE token id. Fall back to the highest kept id anywhere in the block.
+    if (sh.pick == 0xFFFFFFFFu) {
+      sh.red_i[tid] = (uint32_t)(my_last + 1);      // 0 = none, else id+1, so a plain max reduction works
+      __syncthreads();
+      for (uint32_t k = kThr / 2; k; k >>= 1) {
+        if (tid < k) sh.red_i[tid] = max(sh.red_i[tid], sh.red_i[tid + k]);
+        __syncthreads();
+      }
+      if (tid == 0) sh.pick = sh.red_i[0] ? sh.red_i[0] - 1u : 0u;
+      __syncthreads();
+    }
     const uint32_t r = sh.pick;
     __syncthreads();
     return r;
