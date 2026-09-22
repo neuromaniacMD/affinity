@@ -451,6 +451,7 @@ private:
   // shared — which is why this maps reads rather than renaming the layer everywhere.
   // Empty means "every layer owns its own", i.e. V4.
   std::vector<uint32_t> kv_owner_;
+  bool shift_pre_ = false;
   uint32_t kvl(uint32_t l) const { return l < kv_owner_.size() ? kv_owner_[l] : l; }
   // The context a_comp_rows_ was sized for, and how much of it is backed at load. The gap between
   // them is address space that costs nothing until the sequence reaches it — which is 962 expert
@@ -622,6 +623,11 @@ private:
   bool     draft_attend(uint32_t layer, uint32_t n, uint32_t pos0, uint32_t win_lo, float scale);
   // The block's four lanes collapsed and normed into b_norm, where the vocabulary head reads its
   // activation. Call it, then pass x = nullptr to draft_head.
+  // V4.1 shifts the hyper-connection mixes by half a sublayer: a sublayer collapses with what the
+  // PREVIOUS one computed and hands its own forward. V4 collapses with its own, so this is off for
+  // it and every kernel takes the same path it always did.
+  void     set_shift_pre(bool v) { shift_pre_ = v; }
+  static void seed_pre_identity(float* pre, uint32_t n_hc, uint32_t n, void* stream);
   // The V4.1 head epilogue: collapse with the mix already in b_pre. See the definition.
   bool     collapse_pre(int32_t nw, uint32_t n_embd, uint32_t n_hc, float hc_eps, float rms_eps);
   bool     draft_collapse(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,

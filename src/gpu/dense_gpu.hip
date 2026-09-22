@@ -292,6 +292,8 @@ struct DenseGpu::Impl {
     // ---- the hidden state, replicated ---------------------------------------------------------
     float* d_hc = nullptr;    float* d_hc_next = nullptr;
     float* d_pre = nullptr;   float* d_post = nullptr;    float* d_comb = nullptr;
+    // V4.1: the mix the PREVIOUS sublayer computed, which is what this one collapses with.
+    float* d_pre_prev = nullptr;  float* b_pre_prev = nullptr;
     float* d_mix = nullptr;
     // Per-block partial Gram matrices for the wide hc path: nblk * n_hc*(n_hc+1)/2 floats, 640
     // bytes at this shape, and the reason hc_fused_kernel need not be one block. See hc_gram_kernel.
@@ -738,6 +740,7 @@ Model::DenseOps DenseGpu::ops() {
   o.set_kv_owner = [](void* c, const uint32_t* owner, uint32_t n) {
     static_cast<DenseGpu*>(c)->set_kv_owner(owner, n);
   };
+  o.set_shift_pre = [](void* c, bool v) { static_cast<DenseGpu*>(c)->set_shift_pre(v); };
   o.indexer_one = [](void* c, uint32_t l, int32_t h, uint64_t qr, uint32_t nh, uint32_t dim,
                      uint32_t nk, uint32_t nm, uint32_t topk, uint32_t pos, uint32_t nr,
                      RopeDerived rope) {
@@ -1580,10 +1583,13 @@ __global__ __launch_bounds__(kHcThreads) void hc_apply_mg2_kernel(
     const float* __restrict__ mpart,
     const float* __restrict__ scale, const float* __restrict__ base, const float* __restrict__ nw,
     float* __restrict__ pre_out, float* __restrict__ post_out, float* __restrict__ comb_out,
-    float* __restrict__ cur, float* __restrict__ norm,
+    float* __restrict__ cur, float* __restrict__ norm, const float* __restrict__ pre_in,
     uint32_t n_embd, uint32_t iters, float hc_eps, float rms_eps) {
   constexpr uint32_t KM = 2 * NH + NH * NH, NT = kHcTri<NH>;
-  __shared__ float s_g[NH * NH], s_pre[NH], s_post[NH], s_inv, s_mix[KM];
+  // s_pre holds the mix this collapse USES; s_pre_new the one this sublayer COMPUTED. They are the
+  // same on V4. On V4.1 the block collapses with what the previous sublayer computed (`pre_in`) and
+  // hands its own forward — see the shift in the reference's Block.forward.
+  __shared__ float s_g[NH * NH], s_pre[NH], s_pre_new[NH], s_post[NH], s_inv, s_mix[KM];
   const uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   // The last block runs the Sinkhorn and maps nothing. `blockIdx.x != 0` guards a one-block grid,
   // where block 0 would be `last` and skipping the gates would drop the pre/post publish.
@@ -1630,6 +1636,12 @@ __global__ __launch_bounds__(kHcThreads) void hc_apply_mg2_kernel(
     const float mix_scale = rsqrtf(tr / (float)(n_embd * NH) + rms_eps);
     if (!dead) {
       hc_gates_pre<NH>(s_mix, mix_scale, scale, base, s_pre, s_post, hc_eps, lane);
+      // Same wave, so the LDS write below is visible to lane 0's read that follows — the pattern
+      // hc_gates_pre itself relies on.
+      if (lane < NH) {
+        s_pre_new[lane] = s_pre[lane];
+        if (pre_in) s_pre[lane] = pre_in[lane];
+      }
       if (lane == 0) {
         // Double, because pre^T G pre is algebraically a sum of squares but not numerically: G's
         // off-diagonals are signed, and an f32 contraction of the form can cancel several digits for
@@ -1649,7 +1661,10 @@ __global__ __launch_bounds__(kHcThreads) void hc_apply_mg2_kernel(
   }
   __syncthreads();
 
-  if (blockIdx.x == 0 && tid < NH) { pre_out[tid] = s_pre[tid]; post_out[tid] = s_post[tid]; }
+  if (blockIdx.x == 0 && tid < NH) {
+    pre_out[tid] = pre_in ? s_pre_new[tid] : s_pre[tid];
+    post_out[tid] = s_post[tid];
+  }
   if (last) return;                                  // the extra block maps nothing
   const float inv = s_inv;
   const uint32_t nmap = gridDim.x - 1u;
@@ -2184,6 +2199,7 @@ bool DenseGpu::hc_init(uint32_t n_embd, uint32_t n_hc, std::string* err) {
     AFF_HIP_CHECK(hipMalloc(&D.d_hc_next, hc_dim * sizeof(float)));
     AFF_HIP_CHECK(hipMalloc(&D.d_mix, n_out * sizeof(float)));
     AFF_HIP_CHECK(hipMalloc(&D.d_pre, n_hc * sizeof(float)));
+    AFF_HIP_CHECK(hipMalloc(&D.d_pre_prev, n_hc * sizeof(float)));
     AFF_HIP_CHECK(hipMalloc(&D.d_post, n_hc * sizeof(float)));
     AFF_HIP_CHECK(hipMalloc(&D.d_comb, (uint64_t)n_hc * n_hc * sizeof(float)));
     AFF_HIP_CHECK(hipMalloc(&D.d_cur, n_embd * sizeof(float)));
@@ -2200,6 +2216,18 @@ bool DenseGpu::hc_init(uint32_t n_embd, uint32_t n_hc, std::string* err) {
   return true;
 }
 
+// The mix a V4.1 sublayer collapses with, for the FIRST sublayer of a sequence: the reference's
+// `make_identity_pre_mix`, one-hot on lane 0. Lanes are laid out [h][tok], so lane 0's row is the
+// leading `n` floats and the rest are zero.
+void DenseGpu::seed_pre_identity(float* pre, uint32_t n_hc, uint32_t n, void* stream) {
+  if (!pre) return;
+  const float one = 1.0f;
+  uint32_t bits;
+  std::memcpy(&bits, &one, 4);
+  AFF_HIP_CHECK(hipMemsetAsync(pre, 0, (size_t)n_hc * n * sizeof(float), (hipStream_t)stream));
+  AFF_HIP_CHECK(hipMemsetD32Async((hipDeviceptr_t)pre, bits, n, (hipStream_t)stream));
+}
+
 void DenseGpu::hc_seed(const float* embed, uint32_t n_embd, uint32_t n_hc) {
   // A new token: a_allow/a_adm/a_admn hold the PREVIOUS token's admissions. indexer_one re-arms
   // this per layer when the indexer engages; without it a stale layer match reads old admissions.
@@ -2211,6 +2239,7 @@ void DenseGpu::hc_seed(const float* embed, uint32_t n_embd, uint32_t n_hc) {
     for (uint32_t h = 0; h < n_hc; ++h)
       AFF_HIP_CHECK(hipMemcpyAsync(D.d_hc + (size_t)h * n_embd, embed, n_embd * sizeof(float),
                                    hipMemcpyHostToDevice, D.stream));
+    if (shift_pre_) seed_pre_identity(D.d_pre_prev, n_hc, 1, D.stream);
   }
 }
 
@@ -2267,13 +2296,19 @@ bool DenseGpu::hc_pre(int32_t fn, int32_t scale_v, int32_t base_v, int32_t norm_
     hipLaunchKernelGGL(HIP_KERNEL_NAME(hc_apply_mg2_kernel<NH, KMR, kHcSplit>),                   \
                        dim3(nblk + 1), dim3(kHcThreads), 0, D.stream, D.d_hc, D.d_gpart,         \
                        D.d_mpart, D.vec[scale_v], D.vec[base_v], nw, D.d_pre, D.d_post,          \
-                       D.d_comb, D.d_cur, D.d_norm, n_embd, iters, hc_eps, rms_eps);             \
+                       D.d_comb, D.d_cur, D.d_norm, shift_pre_ ? D.d_pre_prev : nullptr,         \
+                       n_embd, iters, hc_eps, rms_eps);                                          \
     AFF_HIP_CHECK(hipGetLastError());                                                            \
   } while (0)
     if (n_hc == 1)      AFF_HC_LAUNCH(1);
     else if (n_hc == 2) AFF_HC_LAUNCH(2);
     else                AFF_HC_LAUNCH(4);
 #undef AFF_HC_LAUNCH
+    // What this sublayer computed is what the NEXT one collapses with (V4.1). Done after the
+    // launch, not before, so the identity seeded at the start of a token survives to the first.
+    if (shift_pre_)
+      AFF_HIP_CHECK(hipMemcpyAsync(D.d_pre_prev, D.d_pre, n_hc * sizeof(float),
+                                   hipMemcpyDeviceToDevice, D.stream));
   }
   {
     // The pinned landing buffer exists whether or not this call wants the copy, because
@@ -3163,7 +3198,7 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
     struct Alloc { float** p; uint64_t rows; const char* name; };
     const Alloc as[] = {
       {&D.b_mix, nout, "mix"},
-      {&D.b_pre, n_hc, "pre"}, {&D.b_post, n_hc, "post"}, {&D.b_comb, (uint64_t)n_hc * n_hc, "comb"},
+      {&D.b_pre, n_hc, "pre"}, {&D.b_pre_prev, n_hc, "pre prev"}, {&D.b_post, n_hc, "post"}, {&D.b_comb, (uint64_t)n_hc * n_hc, "comb"},
       {&D.b_cur, n_embd, "cur"}, {&D.b_norm, n_embd, "norm"}, {&D.b_block, n_embd, "block"},
       // Rows, not tokens: TWO [kHcnChunks][nb] planes and the loop below multiplies by nb. Two,
       // because the expand kernel reads one to re-derive the gates and writes the other.
@@ -3560,6 +3595,8 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
     AFF_HIP_CHECK(hipMemcpyAsync(D.b_emb, pin, live_bytes, hipMemcpyHostToDevice, D.stream));
     AFF_HIP_CHECK(D.emb.done(es, D.stream));
     batch_hc_seed_hip(D.b_emb, D.b_hc, n_embd, n_hc, nb, D.stream);
+    // Every token in the chunk starts its stack with the reference's one-hot mix.
+    if (shift_pre_) seed_pre_identity(D.b_pre_prev, n_hc, nb, D.stream);
   }
   return true;
 }
@@ -3597,13 +3634,21 @@ bool DenseGpu::batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint
                                 ctl ? D.vec[bv] : nullptr, nwp, D.b_pre, D.b_post, D.b_comb,
                                 D.b_cur, D.b_norm, D.b_hcp, fold ? D.q8 : nullptr,
                                 fold ? D.qs : nullptr, n_embd, n_hc, b_nb_, iters, hc_eps,
-                                rms_eps, ctl ? 1 : 0, D.stream);
+                                rms_eps, ctl ? 1 : 0, D.stream,
+                                shift_pre_ ? D.b_pre_prev : nullptr);
+      if (shift_pre_)
+        AFF_HIP_CHECK(hipMemcpyAsync(D.b_pre_prev, D.b_pre, (size_t)n_hc * b_nb_ * sizeof(float),
+                                     hipMemcpyDeviceToDevice, D.stream));
       D.q8_src = fold ? D.b_norm : nullptr;
     }
       else
         batch_hc_fused_hip(D.b_hc, D.b_mix, ctl ? D.vec[sv] : nullptr, ctl ? D.vec[bv] : nullptr,
                            nwp, D.b_pre, D.b_post, D.b_comb, D.b_cur, D.b_norm, n_embd, n_hc, b_nb_,
-                           iters, hc_eps, rms_eps, ctl ? 1 : 0, D.stream);
+                           iters, hc_eps, rms_eps, ctl ? 1 : 0, D.stream,
+                           shift_pre_ ? D.b_pre_prev : nullptr);
+        if (shift_pre_)
+          AFF_HIP_CHECK(hipMemcpyAsync(D.b_pre_prev, D.b_pre, (size_t)n_hc * b_nb_ * sizeof(float),
+                                       hipMemcpyDeviceToDevice, D.stream));
     }
     // ---- the one place both cards are supposed to hold the same bytes -----------------------------
     //

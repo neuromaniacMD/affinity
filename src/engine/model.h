@@ -427,6 +427,10 @@ public:
     // gives every compressing layer its own, and then this is the identity). Handed over once, at
     // load: the raw sliding window stays per layer, so only the compressed half is redirected.
     void (*set_kv_owner)(void* ctx, const uint32_t* owner, uint32_t n) = nullptr;
+    // V4.1 shifts the hyper-connection mixes by half a sublayer — each sublayer collapses with what
+    // the PREVIOUS one computed. V4's own reference collapses with its own, which is what affinity
+    // has always done, so this is off there and nothing about that path changes.
+    void (*set_shift_pre)(void* ctx, bool v) = nullptr;
     // `n_keys` is what the indexer SCORES and `n_mask` what the attention will READ — the two
     // compressors have separate capacities, so the second can be the larger and the rows between
     // them must come back "not admitted" rather than stale.

@@ -1493,7 +1493,7 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
     const float* __restrict__ base, const float* __restrict__ nw, float* __restrict__ pre_out,
     float* __restrict__ post_out, float* __restrict__ comb_out, float* __restrict__ cur,
     float* __restrict__ norm, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t iters,
-    float hc_eps, float rms_eps, int has_control) {
+    float hc_eps, float rms_eps, int has_control, const float* __restrict__ pre_in) {
   __shared__ float red[kBlkStripe * kBlkTok];
   __shared__ float s_pre[kBlkTok * 8], s_post[kBlkTok * 8], s_comb[kBlkTok * 64];
   __shared__ float s_scale[kBlkTok];
@@ -1525,6 +1525,10 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
         post_out[(size_t)h * nb + b] = s_post[bl * 8 + h];
       }
       for (uint32_t i = 0; i < n_hc * n_hc; ++i) comb_out[(size_t)i * nb + b] = s_comb[bl * 64 + i];
+      // V4.1 collapses with the mix the PREVIOUS sublayer computed. The one computed here has just
+      // been published for the next one; `s_pre` now becomes what this collapse actually uses.
+      if (pre_in)
+        for (uint32_t h = 0; h < n_hc; ++h) s_pre[bl * 8 + h] = pre_in[(size_t)h * nb + b];
     }
     __syncthreads();
   }
@@ -1702,7 +1706,8 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_expand_kernel(
     const float* __restrict__ mix, const float* __restrict__ scale,
     const float* __restrict__ base, float* __restrict__ pre_out, float* __restrict__ post_out,
     float* __restrict__ comb_out, float* __restrict__ cur, float* __restrict__ part,
-    uint32_t n_embd, uint64_t hc_dim, uint32_t iters, float hc_eps, float rms_eps) {
+    uint32_t n_embd, uint64_t hc_dim, uint32_t iters, float hc_eps, float rms_eps,
+    const float* __restrict__ pre_in) {
   __shared__ float s[NB * kHcnThreads];
   // The gates, computed HERE and redundantly in every block rather than in a launch of their own.
   // The Sinkhorn is a long dependent chain in NB threads whatever runs it, so doing it in every
@@ -1728,6 +1733,11 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_expand_kernel(
 #pragma unroll
       for (uint32_t i = 0; i < NH * NH; ++i) comb_out[(size_t)i * NB + tid] = comb[i];
     }
+    // See the wide kernel: on V4.1 the collapse uses the previous sublayer's mix, and the one just
+    // computed goes forward through pre_out.
+    if (pre_in)
+#pragma unroll
+      for (uint32_t h = 0; h < NH; ++h) s_pre[h * NB + tid] = pre_in[(size_t)h * NB + tid];
   }
   __syncthreads();
   float g[NH][NB];
@@ -2843,10 +2853,10 @@ void batch_scale_transpose_hip(const float* src, float* dst, uint32_t n, uint32_
 void batch_hc_fused_hip(const uint16_t* hc, const float* mix, const float* scale, const float* base,
                         const float* nw, float* pre, float* post, float* comb, float* cur,
                         float* norm, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t iters,
-                        float hc_eps, float rms_eps, int has_control, void* stream) {
+                        float hc_eps, float rms_eps, int has_control, void* stream, const float* pre_in) {
   AFF_BLAUNCH(batch_hc_fused_kernel, dim3((nb + kBlkTok - 1) / kBlkTok), dim3(kBlkThreads),
                      0, (hipStream_t)stream, hc, mix, scale, base, nw, pre, post, comb, cur, norm,
-                     n_embd, n_hc, nb, iters, hc_eps, rms_eps, has_control);
+                     n_embd, n_hc, nb, iters, hc_eps, rms_eps, has_control, pre_in);
 }
 
 void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float* scale,
@@ -2854,7 +2864,7 @@ void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float
                                float* comb, float* cur, float* norm, float* part, uint8_t* q8,
                                float* qs, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
                                uint32_t iters, float hc_eps, float rms_eps, int has_control,
-                               void* stream) {
+                               void* stream, const float* pre_in) {
   // Not a size the caller may vary: the arena is kNarrowTok columns wide and NB below is that
   // constant. A different width here would read past the plane it was told to reduce.
   if (nb != kNarrowTok || !part) {
@@ -2872,7 +2882,7 @@ void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float
     AFF_BLAUNCH((hcn_sq_kernel<NB>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc);
 #define AFF_HCN_X(NH)                                                                             \
   AFF_BLAUNCH((hcn_expand_kernel<NB, NH>), g, t, 0, st, hc, part, mix, scale, base, pre, post,     \
-              comb, cur, part2, n_embd, (uint64_t)n_embd * n_hc, iters, hc_eps, rms_eps)
+              comb, cur, part2, n_embd, (uint64_t)n_embd * n_hc, iters, hc_eps, rms_eps, pre_in)
     if (n_hc == 1)      { AFF_HCN_X(1); }
     else if (n_hc == 2) { AFF_HCN_X(2); }
     else if (n_hc == 4) { AFF_HCN_X(4); }

@@ -519,6 +519,7 @@ bool Model::load(const std::string& aff_path, std::string* err) {
     layers_[l].kv_owner = owner;
   }
   if (dops_.set_kv_owner) dops_.set_kv_owner(dops_.ctx, kv_owner_.data(), (uint32_t)kv_owner_.size());
+  if (dops_.set_shift_pre) dops_.set_shift_pre(dops_.ctx, cfg_.v41);
   return true;
 }
 
