@@ -2065,6 +2065,11 @@ void StaticPlacement::engine_tick(uint32_t layer, const uint32_t* sel, size_t to
   // Whatever landed since the last layer, applied HERE and by this thread: the transfers are async,
   // the table edits are not.
   engine_retire(streams);
+  // amdnas-fixes plc-verify: every AFF_PLC_VERIFY ticks, read the device table back and compare it with the host words.
+  {
+    static const long kPlcVerifyEvery = std::getenv("AFF_PLC_VERIFY") ? std::atol(std::getenv("AFF_PLC_VERIFY")) : 0;
+    if (kPlcVerifyEvery > 0 && (estats_.ticks % (uint64_t)kPlcVerifyEvery) == 0) verify_plc("tick");
+  }
 
   // The DISTINCT experts, not the slots. A batched dispatch reads an expert's weights once however
   // many of the block's tokens chose it, so a repeat inside one block costs nothing and must not be
@@ -2450,6 +2455,11 @@ void StaticPlacement::snapshot_plane(std::vector<float>* heat, std::vector<uint8
 void StaticPlacement::engine_report() const {
   if (std::getenv("AFF_MOVE_VERIFY"))
     aff::ui::err("move-verify: %llu promoted shards read back, %llu mismatched\n", mv_verified_, mv_bad_);
+  if (std::getenv("AFF_PLC_VERIFY")) {
+    verify_plc("report");
+    aff::ui::err("plc-verify: %llu table checks, %llu persistent device/host mismatches\n",
+                 (unsigned long long)plc_checks_, (unsigned long long)plc_bad_);
+  }
   // Before the engine guard: the SSD tier is reachable under every strategy, including static, and
   // a run that touched it is a run whose throughput has an explanation the other counters cannot
   // give. Silence here is the useful case.
@@ -2538,3 +2548,53 @@ void StaticPlacement::engine_report() const {
 // amdnas-fixes move-verify: AFF_MOVE_VERIFY readback + owner-map checks in engine_retire (2026-09-22).
 
 // amdnas-fixes demote-verify: AFF_MOVE_VERIFY also checks demotion D2H copies and pool-slot ownership (2026-09-22).
+
+// ---- amdnas-fixes plc-verify -----------------------------------------------------------------------------------------
+// The cards consume `plc_[dv]`; every other check in this fork compared host bookkeeping and expert bytes. This reads the
+// fine-grained device table from the host (the same host-visible memory publish_base stores into at load time — no sync,
+// no staging), compares it word for word with `plc_host_`, and treats a disagreement as real only if it survives a
+// device sync (a PlcPatch queued on the compute stream and not yet run is stale by design, not wrong).
+void aff::StaticPlacement::verify_plc(const char* tag) const {
+  if (plc_.empty() || plc_host_.empty() || !impl_) return;
+  const size_t n = (size_t)n_layer_ * n_expert_;
+  const uint64_t ss = slot_stride();
+  for (size_t dv = 0; dv < plc_.size(); ++dv) {
+    if (!plc_[dv]) continue;
+    volatile const uint64_t* dtab = plc_[dv];
+    const uint64_t* htab = plc_host_.data() + dv * n;
+    std::vector<size_t> bad;
+    for (size_t i = 0; i < n; ++i)
+      if (dtab[i] != htab[i]) bad.push_back(i);
+    ++plc_checks_;
+    if (bad.empty()) continue;
+    (void)hipSetDevice(devs_[dv]);
+    (void)hipDeviceSynchronize();
+    auto decode = [&](uint64_t v, char* out, size_t cap) {
+      if (v == 0) { snprintf(out, cap, "ssd(0)"); return; }
+      const uint64_t a = v & kPlcAddrMask;
+      if (v & kPlcResident) {
+        const int64_t off = (int64_t)((uintptr_t)a - (uintptr_t)impl_->slab[dv]);
+        snprintf(out, cap, "slab+%lld(slot %lld%s)", (long long)off, (long long)(ss ? off / (int64_t)ss : -1),
+                 (ss && (off % (int64_t)ss)) ? " UNALIGNED" : "");
+      } else {
+        snprintf(out, cap, "pool 0x%llx", (unsigned long long)a);
+      }
+    };
+    size_t persistent = 0;
+    for (size_t i : bad) {
+      const uint64_t d = dtab[i], hw = htab[i];
+      if (d == hw) continue;
+      ++persistent; ++plc_bad_;
+      if (persistent <= 12) {
+        char sd[96], sh[96];
+        decode(d, sd, sizeof sd); decode(hw, sh, sizeof sh);
+        aff::ui::err("PLC-MISMATCH [%s] card %zu layer %u expert %u: device=%s host=%s (0x%llx vs 0x%llx)\n", tag, dv,
+                     (unsigned)(i / n_expert_), (unsigned)(i % n_expert_), sd, sh, (unsigned long long)d,
+                     (unsigned long long)hw);
+      }
+    }
+    if (persistent)
+      aff::ui::err("PLC-MISMATCH [%s] card %zu: %zu of %zu entries differ after a device sync (check #%llu)\n", tag, dv,
+                   persistent, n, (unsigned long long)plc_checks_);
+  }
+}

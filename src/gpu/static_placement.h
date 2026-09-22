@@ -247,6 +247,9 @@ public:
   // resident counts; a layer starved of slots misses on nearly every token however good the ranking
   // inside it is. The histogram before and after is the whole story.
   void engine_report() const;
+  // amdnas-fixes plc-verify: compare the device placement table with plc_host_ (AFF_PLC_VERIFY=N ticks).
+  void verify_plc(const char* tag) const;
+  mutable uint64_t plc_checks_ = 0, plc_bad_ = 0;
 
   // The cards this placement actually uses. Every one of them needs a keepalive heartbeat, and this
   // is the only place that knows which they are.
