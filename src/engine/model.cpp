@@ -1444,7 +1444,17 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
     blk->tap_rows = 0;
     if (NT && dspark_.ready()) {
       tap_at.assign(cfg_.n_layer, -1);
-      for (uint32_t i = 0; i < NT; ++i) tap_at[(uint32_t)cfg_.dspark_taps[i]] = (int32_t)i;
+      // The tap fires at the END of a layer, so the plane holds that layer's OUTPUT. V4.1's draft
+      // is conditioned on the attention INPUT of its target layers -- `Transformer.forward` appends
+      // `h.mean(dim=2)` before calling the layer, and the reference says so in as many words -- and
+      // the input of layer t is the output of t-1. Tapping t itself would hand the draft a hidden
+      // state one layer further on than the one it was trained against, which costs acceptance
+      // rather than correctness and is therefore invisible except as a draft nobody accepts.
+      for (uint32_t i = 0; i < NT; ++i) {
+        const int32_t t = cfg_.dspark_taps[i];
+        const int32_t at = cfg_.v41 ? t - 1 : t;
+        if (at >= 0 && (uint32_t)at < cfg_.n_layer) tap_at[(uint32_t)at] = (int32_t)i;
+      }
       tap_rows = (blk->tap_keep && blk->tap_keep < n) ? blk->tap_keep : n;
       tap_pos0 = s->pos + (n - tap_rows);           // absolute position of the plane's row 0
       blk->tap_pos0 = tap_pos0;
