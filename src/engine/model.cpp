@@ -550,6 +550,7 @@ bool Model::load(const std::string& aff_path, std::string* err) {
   if (dops_.set_idx_owner)
     dops_.set_idx_owner(dops_.ctx, idx_owner_.data(), (uint32_t)idx_owner_.size());
   if (dops_.set_shift_pre) dops_.set_shift_pre(dops_.ctx, cfg_.v41);
+  if (dops_.set_no_qrms) dops_.set_no_qrms(dops_.ctx, cfg_.v41);
 
   // ---- Engram: the q*k product, once a layer ----------------------------------------------------
   //
@@ -1094,7 +1095,7 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
       dense_mv(w.wq_a, norm.data(), QR, E, qa.data());
       rms_norm(qa.data(), w.q_norm, QR, cfg_.rms_eps, qr_norm.data());
       dense_mv(w.wq_b, qr_norm.data(), (uint64_t)NH * W, QR, q.data());
-      head_rms_norm_inplace(q.data(), NH, W, cfg_.rms_eps);
+      if (!cfg_.v41) head_rms_norm_inplace(q.data(), NH, W, cfg_.rms_eps);   // V4 only, see set_no_qrms
     }
     if (!kv_fused && w.wkv) {                      // ONE shared latent, serving all 64 heads
       norm_ready();

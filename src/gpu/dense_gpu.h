@@ -472,6 +472,7 @@ private:
   // One stderr line the first time the filter actually selects rather than keeping everything.
   void     cand_note(uint32_t layer, uint32_t keys, uint32_t nblk, uint32_t topk_blocks);
   bool shift_pre_ = false;
+  bool no_qrms_ = false;        // V4.1: no per-head RMS on q. See Model's set_no_qrms.
   uint32_t kvl(uint32_t l) const { return l < kv_owner_.size() ? kv_owner_[l] : l; }
   uint32_t idxl(uint32_t l) const { return l < idx_owner_.size() ? idx_owner_[l] : l; }
   // The context a_comp_rows_ was sized for, and how much of it is backed at load. The gap between
@@ -681,6 +682,7 @@ private:
   // PREVIOUS one computed and hands its own forward. V4 collapses with its own, so this is off for
   // it and every kernel takes the same path it always did.
   void     set_shift_pre(bool v) { shift_pre_ = v; }
+  void     set_no_qrms(bool v) { no_qrms_ = v; }
   static void seed_pre_identity(float* pre, uint32_t n_hc, uint32_t n, void* stream);
   // The V4.1 head epilogue: collapse with the mix already in b_pre. See the definition.
   bool     collapse_pre(int32_t nw, uint32_t n_embd, uint32_t n_hc, float hc_eps, float rms_eps);

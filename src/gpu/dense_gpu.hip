@@ -61,7 +61,7 @@ __global__ void rope_tail_kernel(float* __restrict__ x, uint32_t n_head, uint32_
 __global__ void head_rms_rope_kernel(float* __restrict__ x, uint32_t head_dim, float eps,
                                      uint32_t n_rot, uint32_t pos, float freq_scale,
                                      float theta_scale, float ext_factor, float lo, float hi,
-                                     float sin_sign) {
+                                     float sin_sign, int qrms) {
   __shared__ float red[32];
   float* p = x + (size_t)blockIdx.x * head_dim;
   const uint32_t tid = threadIdx.x, nt = blockDim.x;
@@ -77,7 +77,7 @@ __global__ void head_rms_rope_kernel(float* __restrict__ x, uint32_t head_dim, f
     red[0] = rsqrtf(t / (float)head_dim + eps);
   }
   __syncthreads();
-  const float inv = red[0];
+  const float inv = qrms ? red[0] : 1.0f;             // V4.1 has no q RMS: rope only
   for (uint32_t i = tid; i < head_dim; i += nt) p[i] = p[i] * inv;
   __syncthreads();                                   // the scaled values, before they are rotated
   for (uint32_t k = tid; k < n_rot / 2; k += nt)
@@ -768,6 +768,7 @@ Model::DenseOps DenseGpu::ops() {
     return static_cast<DenseGpu*>(c)->engram(w, qk, r, 1u, in, ne, nh, eps, /*batched=*/false);
   };
   o.set_shift_pre = [](void* c, bool v) { static_cast<DenseGpu*>(c)->set_shift_pre(v); };
+  o.set_no_qrms = [](void* c, bool v) { static_cast<DenseGpu*>(c)->set_no_qrms(v); };
   o.indexer_one = [](void* c, const Model::IndexArgs& a) {
     return static_cast<DenseGpu*>(c)->indexer_one(a);
   };
@@ -1944,7 +1945,7 @@ bool DenseGpu::attn_q(int32_t qa, int32_t qb, int32_t qn, const float* x, uint64
     // touches the head that block just normalised.
     hipLaunchKernelGGL(head_rms_rope_kernel, dim3(nh), dim3(128), 0, D.stream,
                        qdst, width, eps, n_rot, pos, rope.freq_scale, rope.theta_scale,
-                       rope.ext_factor, rope.lo, rope.hi, 1.0f);
+                       rope.ext_factor, rope.lo, rope.hi, 1.0f, no_qrms_ ? 0 : 1);
     AFF_HIP_CHECK(hipGetLastError());
     bool need_sync = false;
     if (!to_aq && q_out) {
@@ -3819,7 +3820,7 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
       // two passes over b_q rather than five. b_q is left unscaled: this transpose was its only
       // reader, and b_q is b_htm, which mqa_attend overwrites next.
       if (!batch_head_rms_rope_tr_hip(D.b_q, D.b_qtm, D.b_hinv, nh, width, n_rot, b_pos0_, rope,
-                                      eps, b_nb_, D.stream))
+                                      eps, b_nb_, D.stream, !no_qrms_))
         return false;
       batch_rms_norm_rope_hip(ykv, D.vec[kvnorm], D.b_kv, width, n_rot, b_pos0_, rope, eps, b_nb_,
                               D.stream);

@@ -496,6 +496,10 @@ public:
     // the PREVIOUS one computed. V4's own reference collapses with its own, which is what affinity
     // has always done, so this is off there and nothing about that path changes.
     void (*set_shift_pre)(void* ctx, bool v) = nullptr;
+    // V4.1 dropped the per-head RMS of q that V4 applies before the rope (V4 reference
+    // `model.py:498`, `q *= rsqrt(mean(q^2) + eps)`; absent from V4.1's `Attention.forward` and
+    // `DSparkAttention.forward`). True skips it on every path — batched, single-token and draft.
+    void (*set_no_qrms)(void* ctx, bool v) = nullptr;
     // Which layer's TOP-K each layer reads. V4.1 names index-source layers and the layers after one
     // reuse its admissions; on V4 every indexed layer runs its own and this is the identity. Handed
     // over beside set_kv_owner, and for the same reason: the mask buffer is one plane, and without

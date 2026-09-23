@@ -2759,13 +2759,18 @@ void batch_rms_norm_rope_hip(const float* x, const float* w, float* out, uint32_
 
 bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint32_t n_head,
                                 uint32_t head_dim, uint32_t n_rot, uint32_t pos0, RopeDerived r,
-                                float eps, uint32_t nb, void* stream) {
+                                float eps, uint32_t nb, void* stream, bool qrms) {
   // Both are alignment facts about the model, not tuning: violate either and the tile would have to
   // straddle a head boundary or a rope boundary, and the kernel would be silently wrong for the
   // rows that straddle. Refuse instead — the caller returns false and model.cpp aborts loudly,
   // which is what every other precondition on this path does.
   if (head_dim % kQTr || n_rot % kQTr || n_rot > head_dim) return false;
-  if (nb == kNarrowTok) {
+  if (!qrms) {
+    // V4.1: no per-head RMS. A scale of exactly 1.0 through the same transpose keeps one code path.
+    if (hipMemsetD32Async((hipDeviceptr_t)inv, 0x3f800000, (size_t)n_head * nb,
+                          (hipStream_t)stream) != hipSuccess)
+      return false;
+  } else if (nb == kNarrowTok) {
     AFF_BLAUNCH((hcn_head_rms_inv_kernel<kNarrowTok>), dim3(n_head), dim3(kHcnThreads), 0,
                 (hipStream_t)stream, x, inv, head_dim, eps);
   } else {

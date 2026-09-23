@@ -203,9 +203,10 @@ bool batch_rms_norm_q8_hip(const float* x, const float* w32, const uint16_t* wbf
 //
 // False if the model's head_dim or n_rot is not a multiple of 64, which is the alignment the tile
 // depends on. `dst` is bf16: its only consumer is the attention, which quantises Q to E4M3.
+// `qrms` false (V4.1) skips the per-head RMS: `inv` is filled with 1.0 and only rope + transpose run.
 bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint32_t n_head,
                                 uint32_t head_dim, uint32_t n_rot, uint32_t pos0, RopeDerived rope,
-                                float eps, uint32_t nb, void* stream);
+                                float eps, uint32_t nb, void* stream, bool qrms = true);
 
 // Learned RMS then the RoPE tail — the KV path.
 void batch_rms_norm_rope_hip(const float* x, const float* w, float* out, uint32_t n, uint32_t n_rot,
