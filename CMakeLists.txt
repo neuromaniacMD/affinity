@@ -124,6 +124,7 @@ add_library(aff_format STATIC
   src/engine/tokenizer.cpp
   src/server/server.cpp
   src/engine/model.cpp
+  src/engine/engram.cpp
 )
 target_include_directories(aff_format PUBLIC src)
 find_package(Threads REQUIRED)
@@ -172,6 +173,9 @@ aff_tool(aff-verify   tools/aff_verify.cpp   aff_format)
 aff_tool(aff-probe    tools/aff_probe.cpp    aff_format)
 aff_tool(aff-quantlab tools/aff_quantlab.cpp aff_format)
 # No model, no card, no engine: they read a --route-trace file and nothing else.
+# The n-gram hash, printed, so it can be diffed against the reference's own NgramHashState. It
+# needs no model and no card: the constants come out of tools/v41/engram_prep.py.
+aff_tool(aff-engramcheck tools/aff_engramcheck.cpp aff_format)
 aff_tool(aff-predict  tools/aff_predict.cpp)
 aff_tool(aff-profile  tools/aff_profile.cpp)
 
