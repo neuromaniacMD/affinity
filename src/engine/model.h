@@ -180,8 +180,8 @@ struct LayerWeights {
   // Engram, on `engram_layers` only: q/k are [hc_mult, n_embd] mixes and wkv projects the looked-up
   // n-gram rows. The TABLE itself is not in the container.
   DenseW engram_wkv ;
-  const float*    engram_q = nullptr;
-  const float*    engram_k = nullptr;
+  const uint16_t* engram_q = nullptr;   // bf16 in the container, as in the checkpoint
+  const uint16_t* engram_k = nullptr;
 
   // Shared expert — dense, runs on every token alongside the routed six.
   DenseW shexp_gate ;

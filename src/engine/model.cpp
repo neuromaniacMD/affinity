@@ -46,7 +46,15 @@ struct Binder {
   const Model::DenseOps* dops = nullptr;
   const float* f32(const std::string& n) const {
     const AffTensorEntry* e = r.find_tensor(n);
-    return e ? reinterpret_cast<const float*>(r.tensor_data(*e)) : nullptr;
+    if (!e) return nullptr;
+    // The mirror of bf16()'s check. Without it a bf16 tensor read here is reinterpreted as floats
+    // and over-read by 2x, with no error: that is how V4.1's engram_q/k fed garbage into every gate.
+    if (e->desc.quant != AFF_F32) {
+      aff::ui::fatal("fatal: tensor %s is %s, not f32 — engine and container disagree\n",
+                   n.c_str(), quant_name((AffQuant)e->desc.quant));
+      std::abort();
+    }
+    return reinterpret_cast<const float*>(r.tensor_data(*e));
   }
   const uint16_t* bf16(const std::string& n) const {
     const AffTensorEntry* e = r.find_tensor(n);
@@ -437,8 +445,12 @@ bool Model::load(const std::string& aff_path, std::string* err) {
       w.idx_k_norm  = b.f32(p + "idx_k_norm");
       w.router_b_vl = b.f32(p + "ffn_gate_bias_vl");
       w.engram_wkv  = b.dense(p + "engram_wkv");
-      w.engram_q    = b.f32(p + "engram_q");
-      w.engram_k    = b.f32(p + "engram_k");
+      // bf16, NOT f32: the container keeps the checkpoint's dtype for these two. Read through f32()
+      // they were bf16 bytes reinterpreted as floats — and twice as many of them as the tensor
+      // holds — so the gate's q*k weight was garbage, every gate sat near 0.5, and engram wrote
+      // ~60x the reference's energy into the residual at layers 1 and 14.
+      w.engram_q    = b.bf16(p + "engram_q");
+      w.engram_k    = b.bf16(p + "engram_k");
     }
 
     // Missing weights must fail the load, not degrade the output — see the note on the same check
@@ -574,7 +586,8 @@ bool Model::load(const std::string& aff_path, std::string* err) {
         if (err) *err = "layer " + std::to_string(l) + " is an engram layer with no engram weights";
         return false;
       }
-      for (size_t j = 0; j < qk.size(); ++j) qk[j] = w.engram_q[j] * w.engram_k[j];
+      for (size_t j = 0; j < qk.size(); ++j)
+        qk[j] = bf16_to_float(w.engram_q[j]) * bf16_to_float(w.engram_k[j]);
       const int32_t h = dops_.reg_vec ? dops_.reg_vec(dops_.ctx, qk.data(), qk.size()) : -1;
       if (h < 0) { if (err) *err = "could not register the engram q*k product"; return false; }
       eng_qk_[l] = h;
