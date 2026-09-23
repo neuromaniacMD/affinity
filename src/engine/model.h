@@ -964,7 +964,13 @@ public:
   // The caller is responsible for having filled every cache this then vouches for. Getting that
   // wrong does not fault — attention reads whatever the rows happen to hold — so the check that
   // matters is a hash of the caches against a straight prefill, not anything assertable here.
-  void restore_state(SeqState* s, uint32_t pos) const;
+  //
+  // `ids`, when given, are the sequence token ids from position 0; the engram look-back is
+  // re-seeded from the max_ngram-1 of them before `pos`, which the suffix prefill reads. Without
+  // them a resume hashes its first n-grams from whatever request last filled those slots.
+  // (The look-back is also ONE buffer for the model, not per slot: with --slots > 1 a long
+  // prefill in one slot can overwrite another slot's look-back. Not fixed; the lanes run one slot.)
+  void restore_state(SeqState* s, uint32_t pos, const uint32_t* ids = nullptr) const;
 
 private:
   ExpertMatrixView expert_view(uint32_t layer, uint32_t expert, int which) const;

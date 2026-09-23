@@ -78,7 +78,15 @@ public:
 
   bool ready() const { return c_ != nullptr; }
 
+  // Writes the compressed ids of `n` tokens starting at absolute position `pos0` into the look-back
+  // WITHOUT hashing them. For a sequence that resumes mid-stream from a checkpoint: the suffix
+  // prefill hashes n-grams that reach up to max_ngram-1 positions back into the restored prefix,
+  // and those slots otherwise hold whatever request last ran here.
+  void seed(const uint32_t* ids, uint32_t n, uint64_t pos0);
+  uint32_t lookback() const { return c_ && c_->max_ngram ? c_->max_ngram - 1u : 0u; }
+
 private:
+  void grow(uint64_t end);
   const EngramConsts* c_ = nullptr;
   std::vector<int32_t> cache_;           // compressed id per position, kDead where blocked
   uint64_t filled_ = 0;

@@ -2418,7 +2418,7 @@ int main(int argc, char** argv) {
         dense_gpu.set_slot(slot);
         hit = prefix_cache.lookup(ids.data(), n_pre, &matched);   // index only, no I/O
         if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
-          model.restore_state(&st, hit);
+          model.restore_state(&st, hit, ids.data());
           from = hit;
         }
       }

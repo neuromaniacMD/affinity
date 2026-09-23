@@ -747,8 +747,13 @@ void Model::rollback(SeqState* s, uint32_t keep) const {
   s->pos = keep;
 }
 
-void Model::restore_state(SeqState* s, uint32_t pos) const {
+void Model::restore_state(SeqState* s, uint32_t pos, const uint32_t* ids) const {
   if (!s || s->layer.size() < cfg_.n_layer) return;
+  if (eng_on_ && ids && pos) {
+    if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
+    const uint32_t k = std::min<uint32_t>(pos, eng_h_.lookback());
+    eng_h_.seed(ids + (pos - k), k, pos - k);
+  }
   for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
     LayerState& st = s->layer[l];
     const uint32_t ratio = cfg_.ratio_for(l);

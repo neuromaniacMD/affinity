@@ -4,18 +4,26 @@
 // table, which adds noise to the residual stream rather than failing. So it gets checked directly,
 // against `tools/v41/engram_prep.py --dump-hashes`, before anything is built on top of it.
 //
-//   aff-engramcheck <model.engram> <ids.txt> [--decode] [--gather <ckpt-dir> <out.bin>]
+//   aff-engramcheck <model.engram> <ids.txt> [--decode | --resume K | --resume-noseed K]
+//                   [--gather <ckpt-dir> <out.bin>]
 //
 // `--decode` pushes the ids ONE at a time instead of as one chunk, which is the path a decode step
 // takes: the look-back then has to reach into what earlier pushes cached. Both forms must print the
 // same table, and that equality is the real test — it is the prefill/decode split that a rolling
 // hash state gets wrong.
 //
+// `--resume K` is a prefix-cache resume at position K: the look-back is first filled by a DIFFERENT
+// sequence (the ids reversed — what another request leaves behind), then re-seeded the way
+// Model::restore_state does, then the suffix is pushed from position K. It must print the same
+// table as a straight run. `--resume-noseed K` skips the re-seed and must NOT, which is what shows
+// the check can see the bug it guards against. Rows below K are taken from a straight run.
+//
 // `--gather` additionally mmaps the real tables out of the checkpoint and writes the dequantised
 // lookup for every (token, layer) as f32, which is what checks the two things the hash cannot: the
 // byte offsets, and the FP8 + E8M0 decode.
 #include "engine/engram.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -27,6 +35,10 @@ int main(int argc, char** argv) {
     return 2;
   }
   const bool decode = argc > 3 && std::string(argv[3]) == "--decode";
+  const bool resume = argc > 4 && (std::string(argv[3]) == "--resume" ||
+                                   std::string(argv[3]) == "--resume-noseed");
+  const bool noseed = resume && std::string(argv[3]) == "--resume-noseed";
+  const size_t resume_at = resume ? (size_t)std::strtoul(argv[4], nullptr, 10) : 0;
 
   aff::EngramConsts c;
   std::string err;
@@ -66,6 +78,24 @@ int main(int argc, char** argv) {
       h.push(&ids[t], 1, t, out.data() + t * c.n_layer * c.n_cols);
   else
     h.push(ids.data(), (uint32_t)ids.size(), 0, out.data());
+  if (resume) {
+    if (resume_at == 0 || resume_at >= ids.size()) {
+      std::fprintf(stderr, "fatal: --resume K needs 0 < K < %zu\n", ids.size());
+      return 2;
+    }
+    const size_t row = (size_t)c.n_layer * c.n_cols;
+    std::vector<uint32_t> other(ids.rbegin(), ids.rend());
+    std::vector<int64_t> scratch(other.size() * row);
+    aff::EngramHash r;
+    r.init(&c, ids.size() + 8);
+    r.push(other.data(), (uint32_t)other.size(), 0, scratch.data());   // the stale look-back
+    if (!noseed) {
+      const size_t k = std::min<size_t>(resume_at, r.lookback());
+      r.seed(ids.data() + (resume_at - k), (uint32_t)k, resume_at - k);
+    }
+    r.push(ids.data() + resume_at, (uint32_t)(ids.size() - resume_at), resume_at,
+           out.data() + resume_at * row);
+  }
 
   if (gather_dir) {
     aff::EngramTables t;
