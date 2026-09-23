@@ -9,6 +9,7 @@
 #include "attention.h"
 #include "ops.h"
 #include "expert_kernel.h"
+#include "engine/engram.h"
 #include "format/aff_reader.h"
 
 #include <cstdint>
@@ -324,6 +325,16 @@ public:
   // change an answer at any context short enough to iterate on. Lowering it moves the same code
   // path into range.
   void set_candidate_topk_blocks(uint32_t b) { cand_topk_override_ = b; }
+
+  // ---- Engram ----------------------------------------------------------------------------------
+  //
+  // `file` is what tools/v41/engram_prep.py wrote; `dir` is the checkpoint the 91.6-GiB-a-layer
+  // tables are mmapped out of. Call BEFORE load(), which registers the q*k product per layer.
+  // Without it a V4.1 model still runs -- and is not the released model, because layers 1 and 14
+  // then contribute nothing.
+  bool set_engram(const std::string& file, const std::string& dir, std::string* err);
+  bool engram_on() const { return eng_on_; }
+  uint64_t engram_bytes() const { return eng_t_.bytes(); }
   void set_max_layers(uint32_t n) { max_layers_ = n; }
 
   void init_state(SeqState* s, uint64_t max_pos) const;
@@ -492,6 +503,13 @@ public:
     // everything.
     void (*set_idx_owner)(void* ctx, const uint32_t* owner, uint32_t n) = nullptr;
     bool (*indexer_one)(void* ctx, const IndexArgs& a) = nullptr;
+    // ---- Engram -----------------------------------------------------------------------------
+    // The n-gram lookup written into the hidden state, for ONE token. `rows` is the dequantised
+    // table lookup (n_cols * head_dim floats); `qk_vec` is `q_weight * k_weight` registered once
+    // at load, because the reference only ever uses the two as that product. Everything after the
+    // upload stays on device: the state this writes lives there.
+    bool (*engram)(void* ctx, int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t in_dim,
+                   uint32_t n_embd, uint32_t n_hc, float eps) = nullptr;
     // Tells attn_q to keep qr_norm in VRAM for indexer_one rather than copying it to the host.
     void (*want_qrn_dev)(void* ctx, bool v) = nullptr;
     bool (*attend)(void* ctx, uint32_t layer, const float* q, const uint8_t* allowed,
@@ -610,6 +628,11 @@ public:
     // VRAM — indexer_q and compress put them there — so only the per-token counts come from here.
     // Leaves the admission mask on device, so `attend` is called with a null `allowed`.
     bool (*indexer)(void* ctx, const IndexArgs& a) = nullptr;
+    // Engram for a whole chunk. `rows` is [n][in_dim] token-major. ⚠️ Batching is not an
+    // optimisation here: `engram_wkv` is 157 MiB, so a per-token matvec re-reads all of it every
+    // token — a quarter of a second of weight traffic a layer a chunk at 1,408 tokens.
+    bool (*engram)(void* ctx, int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t n,
+                   uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps) = nullptr;
     bool (*attn_out)(void* ctx, int32_t woa, int32_t wob, uint32_t n_head, uint32_t width,
                      uint32_t n_rot, RopeDerived rope, uint32_t n_groups, uint64_t rank,
                      uint64_t hidden) = nullptr;
@@ -981,6 +1004,15 @@ private:
   // indexed layer runs its own indexer.
   std::vector<uint32_t> idx_owner_;
   uint32_t cand_topk_override_ = 0;
+  // ---- Engram: the hash, the tables, and where each layer's q*k product lives ------------------
+  EngramConsts eng_c_;
+  EngramTables eng_t_;
+  mutable EngramHash eng_h_;
+  bool eng_on_ = false;
+  std::vector<int32_t> eng_qk_;          // layer -> the registered q*k vector, -1 where none
+  std::vector<int32_t> eng_slot_;        // layer -> its column band in the hash, -1 where none
+  mutable std::vector<int64_t> eng_ids_;   // [n][n_layer][n_cols], this call's hash ids
+  mutable std::vector<float>  eng_rows_;   // [n][n_cols*head_dim], the dequantised lookup
   DenseW hc_head_fn_;
   const float* hc_head_base_ = nullptr;
   const float* hc_head_scale_ = nullptr;

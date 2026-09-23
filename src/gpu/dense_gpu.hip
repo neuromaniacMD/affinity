@@ -8,6 +8,7 @@
 #include "gpu/attention_gpu.h"
 #include "gpu/attn_flash.h"
 #include "gpu/compressor_gpu.h"
+#include "gpu/engram_gpu.h"
 #include "gpu/indexer_gpu.h"
 #include "gpu/batch_kernels.h"
 #include "gpu/hip_common.h"
@@ -439,6 +440,12 @@ struct DenseGpu::Impl {
     float* h_tm = nullptr;                                // pinned, b_mid_ * b_cap_ floats
     uint8_t* b_allow = nullptr;                           // device, the same plane
     uint8_t* b_cand = nullptr;                            // the chunk's candidate blocks
+    // Engram. `e_in` is the dequantised table lookup, dim-major [n_cols*head_dim][tile]; `e_out`
+    // the wkv result, [(n_hc+1)*n_embd][tile]. Their own buffers rather than a band of b_y: the
+    // wkv output is 25,600 rows, which is wider than the widest intermediate that arena is sized
+    // for, and borrowing it would tie one lane's capacity to another's.
+    float* e_in = nullptr; float* e_out = nullptr; float* e_stage = nullptr;
+    uint32_t e_tile = 0;
     // ---- THE FOUR STAGING RINGS -----------------------------------------------------------------
     //
     // Every H2D on the hot path whose source the host rewrites. See StageRing for why each is a ring
@@ -562,6 +569,7 @@ DenseGpu::~DenseGpu() {
     // b_htm and b_heads are deliberately absent: they alias b_q and b_qtm.
     for (float* p : bufs) if (p) (void)hipFree(p);
     for (uint16_t* p : {D.b_hc, D.b_hc_next, D.b_qtm}) if (p) (void)hipFree(p);
+    for (float* p : {D.e_in, D.e_out, D.e_stage}) if (p) (void)hipFree(p);
     for (float* p : D.vec) if (p) (void)hipFree(p);
     for (uint16_t* p : D.router) if (p) (void)hipFree(p);
     for (float* p : D.rbias) if (p) (void)hipFree(p);
@@ -755,6 +763,10 @@ Model::DenseOps DenseGpu::ops() {
   o.set_idx_owner = [](void* c, const uint32_t* owner, uint32_t n) {
     static_cast<DenseGpu*>(c)->set_idx_owner(owner, n);
   };
+  o.engram = [](void* c, int32_t w, int32_t qk, const float* r, uint32_t in, uint32_t ne,
+                uint32_t nh, float eps) {
+    return static_cast<DenseGpu*>(c)->engram(w, qk, r, 1u, in, ne, nh, eps, /*batched=*/false);
+  };
   o.set_shift_pre = [](void* c, bool v) { static_cast<DenseGpu*>(c)->set_shift_pre(v); };
   o.indexer_one = [](void* c, const Model::IndexArgs& a) {
     return static_cast<DenseGpu*>(c)->indexer_one(a);
@@ -862,6 +874,11 @@ DenseGpu::Split DenseGpu::split_for(const char* name) {
   // whole row, already replicated — and writes into a replicated key cache that every card scores
   // in full. 128x512 a layer on four layers, so the duplicate is noise against an exchange.
   if (!std::strcmp(s, "idx_wk")) return Split::Rep;
+  // Engram's projection. Its output is one key per hc copy plus a shared value, and the gate that
+  // consumes them reads the hidden state, which is replicated — so a row split would hand each card
+  // half a key and an exchange per engram layer per token to put them back together. 150 MiB a
+  // layer a card, for two layers, against that.
+  if (!std::strcmp(s, "engram_wkv")) return Split::Rep;
   // 64 rows. The indexer weights every head by it and every card scores every head-group.
   if (!std::strcmp(s, "idx_proj")) return Split::Rep;
   // ---- DSpark ---------------------------------------------------------------------------------
@@ -4262,6 +4279,62 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
 //
 // At n = 1 a dim-major GEMM result IS token-major, so the four projections go straight from d_y
 // into the kernel with no transpose.
+// ---- Engram -------------------------------------------------------------------------------------
+//
+// The n-gram lookup, projected and written into the hidden state. What arrives from the host is the
+// dequantised table rows -- `n_cols * head_dim` floats a token, 24 KiB here -- and everything after
+// that stays on device: one GEMM against `engram_wkv` and one gate kernel over the state.
+//
+// ⚠️ The GEMM is the reason prefill must batch. `engram_wkv` is 25,600 x 6,144 FP8 = 157 MiB, and a
+// per-token matvec re-reads all of it every token: at 1,408 tokens that is 221 GiB a layer a chunk,
+// which is a quarter of a second of pure weight traffic where the batched form reads it once. So
+// the tile below is a real tile, not a convenience.
+bool DenseGpu::engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t out_dim) {
+  Impl::Dev& D = *(Impl::Dev*)devp;
+  if (D.e_tile >= tile && D.e_in) return true;
+  for (void** p : {(void**)&D.e_in, (void**)&D.e_out, (void**)&D.e_stage})
+    if (*p) { (void)hipFree(*p); *p = nullptr; }
+  if (hipMalloc(&D.e_in, (size_t)in_dim * tile * sizeof(float)) != hipSuccess) return false;
+  if (hipMalloc(&D.e_out, (size_t)out_dim * tile * sizeof(float)) != hipSuccess) return false;
+  // Token-major staging, because that is how the host gathers rows; a transpose lands it dim-major
+  // for the GEMM. At one token the two layouts are the same and the transpose is skipped.
+  if (hipMalloc(&D.e_stage, (size_t)in_dim * tile * sizeof(float)) != hipSuccess) return false;
+  D.e_tile = tile;
+  return true;
+}
+
+bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t n,
+                      uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps, bool batched) {
+  if (!attn_ok_ || h_wkv < 0 || (size_t)h_wkv >= ent_.size() || !n || !in_dim) return false;
+  if (qk_vec < 0 || (size_t)qk_vec >= n_vec_) return false;
+  AFF_TRACE(33);
+  const Entry& e = ent_[h_wkv];
+  const uint64_t out_dim = (uint64_t)(n_hc + 1u) * n_embd;
+  // Replicated, like every other matrix whose result both cards need whole: the gate reads the
+  // hidden state, which is replicated, so a row split would be half a key per card.
+  if (e.split != Split::Rep || e.cols != in_dim || e.rows < out_dim) return false;
+  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    AFF_HIP_CHECK(hipSetDevice(D.id));
+    hipStream_t st = D.stream;
+    if (!engram_grow(&D, n, in_dim, (uint32_t)out_dim)) return false;
+    void* hc = batched ? (void*)D.b_hc : (void*)D.d_hc;
+    if (!hc) return false;
+    AFF_HIP_CHECK(hipMemcpyAsync(D.e_stage, rows, (size_t)in_dim * n * sizeof(float),
+                                 hipMemcpyHostToDevice, st));
+    const float* x = D.e_stage;
+    if (n > 1u) {                       // token-major -> dim-major; the identity at one token
+      batch_transpose_hip(D.e_stage, D.e_in, n, in_dim, 1, st);
+      x = D.e_in;
+    }
+    batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), x, D.e_out,
+                   (uint32_t)out_dim, in_dim, n, st);
+    engram_gate_hip(hc, batched, D.e_out, D.vec[qk_vec], n_embd, n_hc, n, eps, st);
+  }
+  ++st_.calls;
+  return true;
+}
+
 bool DenseGpu::compress_one(const Model::CompressArgs& a) {
   if (!a.ratio || (a.ratio & (a.ratio - 1u)) || !attn_ok_ || a.n != 1u) return false;
   if (a.h_kv < 0) return false;
@@ -5997,6 +6070,10 @@ Model::BatchOps DenseGpu::batch_ops() {
   };
   o.indexer = [](void* c, const Model::IndexArgs& a) {
     return static_cast<DenseGpu*>(c)->batch_indexer(a);
+  };
+  o.engram = [](void* c, int32_t w, int32_t qk, const float* r, uint32_t n, uint32_t in,
+                uint32_t ne, uint32_t nh, float eps) {
+    return static_cast<DenseGpu*>(c)->engram(w, qk, r, n, in, ne, nh, eps, /*batched=*/true);
   };
   o.attend = [](void* c, uint32_t l, uint32_t b0, uint32_t n, uint32_t p0, const uint8_t* a,
                 uint32_t ms, const uint32_t* nc, float s) {

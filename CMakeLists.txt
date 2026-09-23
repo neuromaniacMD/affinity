@@ -237,7 +237,8 @@ if(AFF_HIP)
                              src/gpu/static_placement.hip src/gpu/dense_gpu.hip
                              src/gpu/attention_gpu.hip src/gpu/keepalive.hip
                              src/gpu/batch_kernels.hip src/gpu/attn_flash.hip
-                             src/gpu/indexer_gpu.hip src/gpu/compressor_gpu.hip)
+                             src/gpu/indexer_gpu.hip src/gpu/compressor_gpu.hip
+  src/gpu/engram_gpu.hip)
   set_source_files_properties(src/gpu/expert_kernel.hip src/gpu/tp_allreduce.hip
                               src/gpu/moe_plan.hip src/gpu/digest.hip src/gpu/vmem.hip
                               src/gpu/static_placement.hip src/gpu/dense_gpu.hip

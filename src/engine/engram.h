@@ -66,7 +66,8 @@ struct EngramConsts {
 // stays blocked.
 class EngramHash {
 public:
-  void init(const EngramConsts* c, uint64_t max_pos);
+  // `hint` sizes the look-back cache initially; it grows on demand, so it is not a bound.
+  void init(const EngramConsts* c, uint64_t hint);
   void reset() { filled_ = 0; }
 
   // Appends `n` token ids starting at absolute position `pos0` and writes their hash ids.

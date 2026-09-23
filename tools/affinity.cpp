@@ -334,6 +334,8 @@ int main(int argc, char** argv) {
   // Oracle knobs, for tools/ref_forward.py: at the shipped index_topk the lightning indexer needs
   // ~2048 positions and all 43 layers before it engages. See Model::set_index_topk.
   uint32_t index_topk = 0, max_layers = 0, cand_topk_blocks = 0;
+  const char* engram_file = nullptr;    // tools/v41/engram_prep.py output
+  const char* engram_dir = nullptr;     // the checkpoint the 91.6-GiB-a-layer tables are mmapped from
   bool dump_tokens = false;
   // Tokens per batched-prefill chunk; 0 disables the batched path. Rounded up to a multiple of 128.
   //
@@ -435,6 +437,8 @@ int main(int argc, char** argv) {
     else if (a == "--persistent-prefix-cache") pcache.persistent = true;
     else if (a == "--prefix-cache-verify") pcache_verify = true;
     else if (a == "--logits-out") logits_out = nxt();
+    else if (a == "--engram") engram_file = nxt();
+    else if (a == "--engram-tables") engram_dir = nxt();
     else if (a == "--index-topk") index_topk = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--candidate-topk-blocks")
       cand_topk_blocks = (uint32_t)std::strtoul(nxt(), nullptr, 10);
@@ -654,6 +658,12 @@ int main(int argc, char** argv) {
         "                              positions, so nothing short enough to iterate on exercises\n"
         "                              level two at all. Lowering it moves the same code path into\n"
         "                              range. 0 leaves the container's value alone.\n"
+        "      --engram FILE           the n-gram hash constants, from tools/v41/engram_prep.py.\n"
+        "      --engram-tables DIR     the checkpoint whose shards hold the tables (91.6 GiB a\n"
+        "                              layer, mmapped and demand-paged, never read whole).\n"
+        "                              Both are needed together; without them a V4.1 model runs\n"
+        "                              with layers 1 and 14 contributing nothing, which is not the\n"
+        "                              released model.\n"
         "      --index-topk K          override the indexer's top-k. Oracle use only: the shipped\n"
         "                              512 needs ~2048 positions before the indexer engages, which\n"
         "                              no numpy reference reaches. Pass the same K to\n"
@@ -714,6 +724,20 @@ int main(int argc, char** argv) {
   Model model;
   if (index_topk) model.set_index_topk(index_topk);
   if (cand_topk_blocks) model.set_candidate_topk_blocks(cand_topk_blocks);
+  // Before load(), which registers the q*k product per engram layer.
+  if (engram_file || engram_dir) {
+    if (!engram_file || !engram_dir) {
+      aff::ui::err("fatal: --engram and --engram-tables go together\n");
+      return 1;
+    }
+    std::string eerr;
+    if (!model.set_engram(engram_file, engram_dir, &eerr)) {
+      aff::ui::err("fatal: engram: %s\n", eerr.c_str());
+      return 1;
+    }
+    aff::ui::out("engram: %s, tables %.1f GiB mmapped from %s\n", engram_file,
+                 (double)model.engram_bytes() / (1024.0 * 1024 * 1024), engram_dir);
+  }
   if (max_layers) model.set_max_layers(max_layers);
 #ifdef AFF_WITH_HIP
   // Dense goes to VRAM first; placement sizes the expert slabs from what is left. Reversed,

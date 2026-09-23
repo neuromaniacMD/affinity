@@ -84,9 +84,11 @@ bool EngramConsts::load(const std::string& path, std::string* err) {
   return true;
 }
 
-void EngramHash::init(const EngramConsts* c, uint64_t max_pos) {
+void EngramHash::init(const EngramConsts* c, uint64_t hint) {
   c_ = c;
-  cache_.assign((size_t)max_pos + 1u, EngramConsts::kDead);
+  // A hint, not a bound: the cache grows in `push`. Sizing it from --kv-size would take 4 MB of
+  // first-touched zeroes at a 1M context for a buffer most runs never reach the end of.
+  cache_.assign((size_t)(hint ? hint : 4096u) + 1u, EngramConsts::kDead);
   filled_ = 0;
 }
 
@@ -98,9 +100,15 @@ void EngramHash::push(const uint32_t* ids, uint32_t n, uint64_t pos0, int64_t* o
 
   // The compressed ids first, so a later position in this same batch can look back at an earlier
   // one. The reference writes the whole chunk into its cache before hashing any of it.
+  if ((size_t)(pos0 + n) > cache_.size()) {
+    // Grow geometrically: a sequence that reaches 1M positions must not reallocate a million times,
+    // and the look-back only ever reads BEHIND the write, so nothing is lost by moving the buffer.
+    size_t want = cache_.size() ? cache_.size() : 4096u;
+    while (want < (size_t)(pos0 + n)) want *= 2u;
+    cache_.resize(want, EngramConsts::kDead);
+  }
   for (uint32_t t = 0; t < n; ++t) {
     const size_t p = (size_t)(pos0 + t);
-    if (p >= cache_.size()) return;
     const uint32_t id = ids[t];
     const int32_t m = id < c.vocab ? c.token_map[id] : 0;
     cache_[p] = (alive && !alive[t]) ? EngramConsts::kDead : m;

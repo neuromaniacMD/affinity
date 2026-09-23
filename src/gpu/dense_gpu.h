@@ -601,6 +601,12 @@ private:
   // The same two compressors and indexer for one token — decode must run the device
   // implementation because the device owns the cross-chunk window prefill left behind.
   bool     compress_one(const Model::CompressArgs& a);
+  // Engram: the n-gram lookup projected by `engram_wkv` and written into the hidden state.
+  // `rows` is the dequantised table lookup on the host, [n][in_dim] token-major; `batched` picks
+  // the prefill hidden state (bf16, a whole chunk) over the decode one (f32, one token).
+  bool     engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t n, uint32_t in_dim,
+                  uint32_t n_embd, uint32_t n_hc, float eps, bool batched);
+  bool     engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t out_dim);
   bool     indexer_one(const Model::IndexArgs& a);
   // Tells attn_q to keep qr_norm in VRAM for indexer_one instead of copying it to the host.
   //

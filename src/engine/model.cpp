@@ -16,6 +16,7 @@
 //     expand weights are recomputed per token from the lanes themselves.
 
 #include "model.h"
+#include "engine/threadpool.h"
 #include "threadpool.h"
 #include "engine/instrument.h"
 #include "gpu/attention_gpu.h"          // kAttnBatch: the prefill attention sub-batch
@@ -549,6 +550,43 @@ bool Model::load(const std::string& aff_path, std::string* err) {
   if (dops_.set_idx_owner)
     dops_.set_idx_owner(dops_.ctx, idx_owner_.data(), (uint32_t)idx_owner_.size());
   if (dops_.set_shift_pre) dops_.set_shift_pre(dops_.ctx, cfg_.v41);
+
+  // ---- Engram: the q*k product, once a layer ----------------------------------------------------
+  //
+  // The reference only ever uses `q_weight` and `k_weight` as their elementwise product, so it is
+  // formed here and registered as one vector rather than multiplied on every token. Layers with no
+  // engram, and a run with no engram file, leave the handle at -1 and the layer loop skips.
+  eng_qk_.assign(cfg_.n_layer, -1);
+  eng_slot_.assign(cfg_.n_layer, -1);
+  if (eng_on_) {
+    if (eng_c_.n_layer != cfg_.engram_layers.size()) {
+      if (err) *err = "the engram file and the container disagree on how many engram layers exist";
+      return false;
+    }
+    if (eng_c_.head_dim * eng_c_.n_cols == 0) { if (err) *err = "degenerate engram geometry"; return false; }
+    std::vector<float> qk((size_t)cfg_.hc_mult * cfg_.n_embd);
+    for (uint32_t i = 0; i < eng_c_.n_layer; ++i) {
+      const uint32_t l = (uint32_t)cfg_.engram_layers[i];
+      if (l >= cfg_.n_layer) { if (err) *err = "engram layer id outside the model"; return false; }
+      const LayerWeights& w = layers_[l];
+      if (!w.engram_q || !w.engram_k || !w.engram_wkv) {
+        if (err) *err = "layer " + std::to_string(l) + " is an engram layer with no engram weights";
+        return false;
+      }
+      for (size_t j = 0; j < qk.size(); ++j) qk[j] = w.engram_q[j] * w.engram_k[j];
+      const int32_t h = dops_.reg_vec ? dops_.reg_vec(dops_.ctx, qk.data(), qk.size()) : -1;
+      if (h < 0) { if (err) *err = "could not register the engram q*k product"; return false; }
+      eng_qk_[l] = h;
+      eng_slot_[l] = (int32_t)i;
+    }
+  }
+  return true;
+}
+
+bool Model::set_engram(const std::string& file, const std::string& dir, std::string* err) {
+  if (!eng_c_.load(file, err)) return false;
+  if (!eng_t_.open(&eng_c_, dir, err)) return false;
+  eng_on_ = true;
   return true;
 }
 
@@ -878,6 +916,19 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     if (dev_hc) dops_.hc_seed(dops_.ctx, e.data(), E, HC);
   }
 
+  // ---- Engram: the hash ids for THIS token, before any layer runs -----------------------------
+  //
+  // The reference hashes the whole input up front and then hands each engram layer its own band
+  // (`Transformer.forward`), so the look-back state is advanced exactly once a position however
+  // many layers read it. Doing it per layer would advance it twice and hash the second layer
+  // against a sequence one token too long.
+  if (eng_on_) {
+    if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
+    eng_ids_.resize((size_t)eng_c_.n_layer * eng_c_.n_cols);
+    eng_rows_.resize((size_t)eng_c_.n_cols * eng_c_.head_dim);
+    eng_h_.push(&token_id, 1, pos, eng_ids_.data());
+  }
+
   std::vector<float> cur(E), norm(E), qa(QR), qr_norm(QR), q((size_t)NH * W), kv(W), raw(W);
   std::vector<float> comp_kv(2 * W), comp_sc(2 * W);
   // Separate from comp_kv/comp_sc, not aliased onto them: all four matvecs are issued in one batch,
@@ -892,6 +943,21 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     const LayerWeights& w = layers_[l];
     LayerState& st = s->layer[l];
     HcControl hcc;
+
+    // ---- Engram, BEFORE the block -------------------------------------------------------------
+    // The reference writes into the residual stream between layers, not inside one, and before the
+    // draft's tap reads it. The gather is the expensive half: 24 rows of a 91.6 GiB mmap, which is
+    // 24 page faults on a cold n-gram.
+    if (eng_on_ && eng_slot_[l] >= 0 && dops_.engram) {
+      const uint32_t i = (uint32_t)eng_slot_[l];
+      eng_t_.gather(i, eng_ids_.data() + (size_t)i * eng_c_.n_cols, eng_rows_.data());
+      if (!dops_.engram(dops_.ctx, w.engram_wkv.gpu, eng_qk_[l], eng_rows_.data(),
+                        eng_c_.n_cols * eng_c_.head_dim, E, HC, cfg_.rms_eps)) {
+        aff::ui::fatal("fatal: engram refused at layer %u — the hidden state lives in VRAM and "
+                     "this write is part of the model\n", l);
+        std::abort();
+      }
+    }
 
     AFF_PH(hyper);
     // Every host read of `norm` in this layer goes through here first. `norm` is computed on device
@@ -1551,9 +1617,44 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
     }
     AFF_PH(hyper);
 
+    // ---- Engram: this chunk's hash ids, before any layer runs ---------------------------------
+    // See the decode path: the look-back state advances once a POSITION, not once a layer.
+    if (eng_on_) {
+      if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
+      eng_ids_.resize((size_t)live * eng_c_.n_layer * eng_c_.n_cols);
+      eng_rows_.resize((size_t)live * eng_c_.n_cols * eng_c_.head_dim);
+      eng_h_.push(ids + base, live, pos0, eng_ids_.data());
+    }
+
     for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
       const LayerWeights& w = layers_[l];
       LayerState& st = s->layer[l];
+
+      // ---- Engram, BEFORE the block ------------------------------------------------------------
+      // One call for the whole chunk, which is not an optimisation: `engram_wkv` is 157 MiB, so a
+      // per-token matvec would re-read it 1,408 times a layer. The gather ahead of it is the part
+      // that genuinely costs -- `live * n_cols` random rows of a 91.6 GiB mmap.
+      if (eng_on_ && eng_slot_[l] >= 0 && bops_.engram) {
+        const uint32_t i = (uint32_t)eng_slot_[l];
+        const uint32_t in_dim = eng_c_.n_cols * eng_c_.head_dim;
+        // ★ THE expensive half, and it parallelises perfectly. Each token's 24 rows land in a
+        // different part of a 91.6 GiB mapping, so a cold one is 24 independent page faults — the
+        // thread is asleep on NVMe, not busy. Serially that is the single largest cost engram adds
+        // to a long prompt; the work itself is a memcpy and a multiply.
+        parallel_for(live, 64, [&](uint64_t b0, uint64_t b1) {
+          for (uint64_t t = b0; t < b1; ++t)
+            eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
+                          eng_rows_.data() + (size_t)t * in_dim);
+        });
+        // Fatal, not a refusal: a `false` here would fall through to the per-token prefill, which
+        // does not run engram at all, and the run would silently become the model without it.
+        if (!bops_.engram(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], eng_rows_.data(), live, in_dim,
+                          E, HC, cfg_.rms_eps)) {
+          aff::ui::fatal("fatal: engram refused at layer %u in batched prefill — this write is "
+                       "part of the model, not an optimisation\n", l);
+          std::abort();
+        }
+      }
 
       // ---- attention sublayer --------------------------------------------------------------
       // The indexer engages once the compressed cache outgrows index_topk. Within a chunk that can
