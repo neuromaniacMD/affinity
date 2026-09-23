@@ -53,6 +53,13 @@ struct EncodeOpts {
   // The prompt string carries its own BOS, so the tokenizer must NOT add another. Callers pass
   // add_bos=false to Tokenizer::encode.
   bool            add_bos          = true;
+  // DeepSeek-V4.1's `encoding.py`: effort is a NUMBER, rendered as
+  // `<｜System｜>Reasoning Effort: N (range 1-100, ...)\n\n` before the first message in thinking
+  // mode, and system messages carry the `<｜System｜>` token (V4 renders a leading system message
+  // bare). `reasoning_effort` above is ignored when this is set. Tools still render V4's DSML tags —
+  // V4.1 renamed them ("<｜DSML｜ calls>" etc.) and that is NOT ported yet.
+  bool            v41              = false;
+  int             effort_budget    = 100;
 };
 
 // The prompt for a conversation, ending in the assistant prefix and its think marker.

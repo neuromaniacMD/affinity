@@ -14,6 +14,7 @@ const char* const kAssistant  = "<｜Assistant｜>";
 const char* const kReminder   = "<｜latest_reminder｜>";
 const char* const kThinkStart = "<think>";
 const char* const kDsml       = "｜DSML｜";
+const char* const kSystem     = "<｜System｜>";           // V4.1
 
 // Verbatim from REASONING_EFFORT_PROMPTS. The trailing blank line is part of the prefix.
 const char* const kEffortHigh =
@@ -329,7 +330,17 @@ std::string encode_messages(const std::vector<ChatMsg>& in, const EncodeOpts& op
   for (size_t idx = 0; idx < msgs.size(); ++idx) {
     const ChatMsg& m = msgs[idx];
 
-    if (idx == 0 && thinking) {
+    if (opts.v41) {
+      // render_reasoning_effort + the SYSTEM_SP_TOKEN rule in V4.1's `_render_message`: the token
+      // leads message 0 when there is an effort prefix or message 0 is a system message, and a
+      // system message anywhere later carries its own.
+      const bool effort = idx == 0 && thinking;
+      if (idx == 0 && (effort || m.role == "system")) out += kSystem;
+      if (effort)
+        out += "Reasoning Effort: " + std::to_string(opts.effort_budget) +
+               " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+      if (idx > 0 && m.role == "system") out += kSystem;
+    } else if (idx == 0 && thinking) {
       if (opts.reasoning_effort == ReasoningEffort::High) out += kEffortHigh;
       else if (opts.reasoning_effort == ReasoningEffort::Max) out += kEffortMax;
     }

@@ -2349,6 +2349,16 @@ int main(int argc, char** argv) {
     eo.reasoning_effort = req.reasoning_effort == "low"  ? ReasoningEffort::Low
                         : req.reasoning_effort == "high" ? ReasoningEffort::High
                                                          : ReasoningEffort::Max;
+    // V4.1 takes a number: low/high/max = 50/75/100 per its encoding.py, or "1".."100". Unset is
+    // `max` (100) here for the same reason as above, where V4.1's reference defaults to 75.
+    eo.v41 = model.config().v41;
+    if (eo.v41) {
+      const std::string& e = req.reasoning_effort;
+      int b = e == "low" ? 50 : e == "high" ? 75 : 100;
+      if (!e.empty() && e.find_first_not_of("0123456789") == std::string::npos && e.size() <= 3)
+        b = std::max(1, std::min(100, std::atoi(e.c_str())));
+      eo.effort_budget = b;
+    }
     // A conversation with nothing in it is refused rather than encoded. The prompt would be four
     // control tokens, which the model answers by observing that it has not been asked anything --
     // and a degenerate sequence has, separately, been seen to fault the engine downstream. Neither
