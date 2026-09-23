@@ -46,8 +46,17 @@ case "$mode" in
     echo "ready"
     ;;
   bench)
+    # Prompt names are resolved against $MODELS when they are not paths that exist here. The
+    # fixtures live beside the model, not beside this script, and `./run.sh bench n4k.txt` from the
+    # tools directory is the obvious thing to type — it should not be the thing that fails.
+    args=()
+    for f in "$@"; do
+      if [ -e "$f" ]; then args+=("$f")
+      elif [ -e "$MODELS/$f" ]; then args+=("$MODELS/$f")
+      else echo "run.sh: no such prompt: $f (looked here and in $MODELS)" >&2; exit 2; fi
+    done
     exec env URL="http://127.0.0.1:$PORT/v1/chat/completions" NGEN="${NGEN:-64}" \
-      python3 "$(dirname "$0")/bench_pp_tg.py" "$@"
+      python3 "$(dirname "$0")/bench_pp_tg.py" "${args[@]}"
     ;;
   *) echo "usage: run.sh once|serve|bench ..." >&2; exit 2 ;;
 esac
