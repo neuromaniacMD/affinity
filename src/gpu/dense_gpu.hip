@@ -2595,18 +2595,30 @@ void DenseGpu::kv_autogrow_start(uint64_t margin) {
   kv_backed_.store(a_init_pos_, std::memory_order_release);
   kv_grow_run_.store(true, std::memory_order_release);
   kv_grow_ = std::thread([this] {
+    // The target a commit last FAILED to reach. Without it a target the card cannot hold is retried
+    // every ~520 ms for as long as the sequence sits in that margin: `want` is quantised and capped
+    // at --kv-size, so it does not move, and each retry is 86 driver calls into a card with no free
+    // VRAM, contending with the dispatch thread. Measured on V4.1 (amdnas, 2026-09-22): a 63,850-token
+    // prompt against 65,536 backed of 69,632 reserved wanted 69,632 it could never get, and decode
+    // fell 21.0 -> 14.7 tok/s while the sequence it was serving needed only 63,914. Retry only a
+    // LARGER target; the dispatch already refuses to write past kv_backed_positions().
+    // A position that moves BACKWARDS is a new sequence, which gets a fresh attempt.
+    uint64_t failed = 0, last_pos = 0;
     while (kv_grow_run_.load(std::memory_order_acquire)) {
       const uint64_t pos = kv_pos_.load(std::memory_order_relaxed);
+      if (pos < last_pos) failed = 0;
+      last_pos = pos;
       const uint64_t m = kv_margin_.load(std::memory_order_relaxed);
       // Quantised to whole margins, so growth fires ONCE every `m` positions in one jump rather
       // than mapping a few pages on every tick as the sequence creeps forward. Each growth is 86
       // driver calls (43 layers, 2 cards) and they are only cheap because they are rare.
       const uint64_t want = std::min(((pos + m) / m + 1) * m, a_max_pos_);
-      if (want > kv_backed_.load(std::memory_order_relaxed)) {
+      if (want > kv_backed_.load(std::memory_order_relaxed) && want > failed) {
         std::string err;
         if (kv_commit_positions(want, &err)) {
           kv_backed_.store(want, std::memory_order_release);
         } else {
+          failed = want;
           // Out of VRAM to grow into. Say so once and stop trying: the dispatch checks
           // kv_backed_positions() before it writes, so this surfaces as a refusal to continue the
           // sequence rather than as a fault in an attention kernel.
