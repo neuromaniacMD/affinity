@@ -13,7 +13,7 @@ URL = os.environ.get("URL", "http://127.0.0.1:8099/v1/chat/completions")
 FACT = "ZANTHIC-4471"
 ok = 0
 for f in sys.argv[1:]:
-    body = {"model": "affinity", "messages": [{"role": "user", "content": open(f).read()}],
+    body = {"model": os.environ.get("MODEL", "affinity"), "messages": [{"role": "user", "content": open(f).read()}],
             "max_tokens": 24, "temperature": 0.0, "thinking_mode": "chat"}
     req = urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json"})
     t0 = time.time()
