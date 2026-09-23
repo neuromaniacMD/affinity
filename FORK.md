@@ -84,7 +84,9 @@ docker build -f docker/Dockerfile -t affinity:v4-fixes .    # from the repo root
 `aff-quantize` (built alongside the engine; a CPU job, no GPU needed) converts the Hugging Face FP8 checkpoint
 into an affinity container. **Only the routed experts are quantised**: 2.875 bpw with the engine's codebook quant
 (2 variants x 1,024 entries), imatrix-weighted. Dense weights stay in the checkpoint's FP8 (6.2 GiB) and the
-embedding / head in bf16 (2.0 GiB). No quantised weights are published here; you build your own container.
+embedding / head in bf16 (2.0 GiB). The weights are not in this repo. A prebuilt DeepSeek-V4-Flash-0731 container made exactly as below is on
+Hugging Face: **[neuromaniacmd/DeepSeek-V4-Flash-0731-affinity-2.875bpw](https://huggingface.co/neuromaniacmd/DeepSeek-V4-Flash-0731-affinity-2.875bpw)** (three parts plus the draft,
+with SHA256SUMS; reassemble with `cat model-0731.aff.part-* > model-0731.aff`).
 
 **DeepSeek-V4-Flash and V4-Flash-0731** (single machine):
 ```sh
@@ -93,8 +95,9 @@ aff-quantize --src <checkpoint> --out model-0731.aff --imatrix <imatrix> --threa
 aff-quantize --src <checkpoint> --out model-0731.dspark.aff --dspark --codebook model-0731.aff
 aff-info model-0731.aff
 ```
-- Imatrix: a wikitext imatrix for the original V4-Flash. 0731 is the same architecture, so the V4 imatrix was
-  reused as-is.
+- Imatrix: `imatrix/imatrix-v4-flash.dat` from [teamblobfish/DeepSeek-V4-Flash-GGUF](https://huggingface.co/teamblobfish/DeepSeek-V4-Flash-GGUF),
+  the one upstream's README uses (a wikitext imatrix for the original V4-Flash). 0731 is the same architecture, so
+  it was reused as-is.
 - Cost: main container **101.05 GiB in ~2 h 30 min** (1.4 experts/s, 4.7 GB RSS, 24 threads); draft **7.0 GiB in
   11 min**. The draft is 0731's own bundled 3-layer DSpark head, quantised against the main container's codebook.
   Disk: ~156 GiB checkpoint + ~108 GiB output.
