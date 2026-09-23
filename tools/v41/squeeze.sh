@@ -54,7 +54,7 @@ arm() {   # arm <name> <extra flags...> -- <workload function>   (ARM_IMG overri
   grep -iE "hit rate|hit|resumed|cannot grow|restored" "$OUT/$name.server.log" | tail -8 | sed "s/^/  /"
 }
 
-w_backed() { ./run.sh bench n16k.txt n48k.txt n64k.txt
+w_backed() { ./run.sh bench n4k.txt n8k.txt n16k.txt n32k.txt n48k.txt n64k.txt
              URL=$URL python3 -u turn2.py /mnt/models2/affinity/v41/n16k.txt n16k
              URL=$URL python3 -u turn2.py /mnt/models2/affinity/v41/n64k.txt n64k; }
 w_prefix() { URL=$URL python3 -u turn2.py /mnt/models2/affinity/v41/n16k.txt n16k

@@ -334,6 +334,8 @@ public:
   // then contribute nothing.
   bool set_engram(const std::string& file, const std::string& dir, std::string* err);
   bool engram_on() const { return eng_on_; }
+  // Width of one token's gathered table rows (n_cols * head_dim), i.e. engram_wkv's input. 0 if off.
+  uint32_t engram_in_dim() const { return eng_on_ ? eng_c_.n_cols * eng_c_.head_dim : 0u; }
   uint64_t engram_bytes() const { return eng_t_.bytes(); }
   void set_max_layers(uint32_t n) { max_layers_ = n; }
 

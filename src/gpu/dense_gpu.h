@@ -168,6 +168,11 @@ public:
   // `key_layers`, when given, is one byte a layer marking the layers that OWN indexer keys — V4.1's
   // kv sources. Null derives the V4 rule, where a key cache and an index-compressor ring are the
   // same set.
+  // Engram's staging, lookup and projection buffers for a `tile`-token chunk, on every card. Called
+  // at load, before StaticPlacement: grown lazily on the first prefill they came out of the free-VRAM
+  // reserve AFTER placement had handed the rest to expert shards — 214 MiB at a 1,408 chunk (most
+  // of the 261 MiB reserve the pool-poisoning fix depends on), an OOM at 2,816.
+  bool engram_reserve(uint32_t tile, uint32_t in_dim, uint32_t out_dim);
   bool reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_t width, uint32_t idx_dim,
                        uint32_t idx_heads, std::string* err,
                        const uint8_t* key_layers = nullptr, uint32_t cand_block = 0);

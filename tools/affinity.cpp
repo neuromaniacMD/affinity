@@ -1035,6 +1035,13 @@ int main(int argc, char** argv) {
                                    c.v41 && c.candidate_source_layer >= 0 ? c.candidate_block : 0u))
       aff::ui::out("runtime reservation: %s — expert placement will over-commit\n", rerr.c_str());
     vram.mark("compressor + indexer");
+    // Engram's buffers at the full prefill chunk, for the same reason and in the same place.
+    if (model.engram_on() && prefill_chunk > 0) {
+      const uint32_t out_dim = (uint32_t)(c.hc_mult + 1u) * c.n_embd;
+      if (!dense_gpu.engram_reserve(prefill_chunk, model.engram_in_dim(), out_dim))
+        aff::ui::out("engram reservation failed — its buffers will come out of the free-VRAM reserve\n");
+      vram.mark("engram");
+    }
 
     // ---- the prefix cache ------------------------------------------------------------------------
     //
@@ -2241,7 +2248,7 @@ int main(int argc, char** argv) {
   // the server here made every deployment claim to serve something called "affinity" and made two
   // engines serving the same weights look like two different models. `owned_by` is where the engine
   // belongs, and that still says affinity.
-  srv.set_model_name("DeepSeek-V4-Flash");
+  srv.set_model_name(model.config().v41 ? "DeepSeek-V4.1-Flash" : "DeepSeek-V4-Flash");
   // The container's own encoder, not a hand-rolled template: this release ships no Jinja
   // chat_template and points at `encoding/` instead. src/engine/chat_encode.cpp transcribes it and
   // tests/test_chat_encode.cpp holds it to the container's fixtures byte for byte.

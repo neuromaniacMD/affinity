@@ -4316,6 +4316,15 @@ bool DenseGpu::engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t 
   return true;
 }
 
+bool DenseGpu::engram_reserve(uint32_t tile, uint32_t in_dim, uint32_t out_dim) {
+  if (!impl_ || !tile || !in_dim || !out_dim) return false;
+  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
+    if (!engram_grow(&impl_->dev[d], tile, in_dim, out_dim)) return false;
+  }
+  return true;
+}
+
 bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t n,
                       uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps, bool batched) {
   if (!attn_ok_ || h_wkv < 0 || (size_t)h_wkv >= ent_.size() || !n || !in_dim) return false;
