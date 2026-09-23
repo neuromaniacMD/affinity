@@ -4342,7 +4342,10 @@ bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t
     }
     batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), x, D.e_out,
                    (uint32_t)out_dim, in_dim, n, st);
-    engram_gate_hip(hc, batched, D.e_out, D.vec[qk_vec], n_embd, n_hc, n, eps, st);
+    // `e_out` is [out_dim][n]; the state is [n_hc*n_embd][b_nb_] when batched, and b_nb_ is the
+    // chunk's PADDED width, not `n`. Indexing the state with `n` read and wrote every token past
+    // the first column at the wrong offset whenever a chunk was not already its padded width.
+    engram_gate_hip(hc, batched, D.e_out, D.vec[qk_vec], n_embd, n_hc, n, batched ? b_nb_ : n, eps, st);
   }
   ++st_.calls;
   return true;

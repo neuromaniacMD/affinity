@@ -30,6 +30,6 @@ namespace aff {
 // first n_hc bands are the per-copy keys and the last is the shared value. `w` is [n_hc][n_embd]
 // f32. The state is updated in place.
 void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, uint32_t n_embd,
-                     uint32_t n_hc, uint32_t nb, float eps, void* stream);
+                     uint32_t n_hc, uint32_t nb, uint32_t hc_stride, float eps, void* stream);
 
 }  // namespace aff

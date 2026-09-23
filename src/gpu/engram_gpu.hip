@@ -23,7 +23,7 @@ __device__ __forceinline__ void st_hc(void* p, size_t i, float v, bool bf16) {
 template <bool BF16>
 __global__ void engram_gate_kernel(void* __restrict__ hc, const float* __restrict__ kv,
                                    const float* __restrict__ w, uint32_t n_embd, uint32_t n_hc,
-                                   uint32_t nb, float eps) {
+                                   uint32_t nb, uint32_t hs, float eps) {
   const uint32_t c = blockIdx.x;
   const uint32_t t = blockIdx.y * blockDim.x + threadIdx.x;
   if (t >= nb || c >= n_hc) return;
@@ -35,9 +35,8 @@ __global__ void engram_gate_kernel(void* __restrict__ hc, const float* __restric
   // the reference does this in float and casts only on the way back.
   float sh = 0.0f, sk = 0.0f, dot = 0.0f;
   for (uint32_t i = 0; i < n_embd; ++i) {
-    const size_t off = (band + i) * nb + t;
-    const float h = ld_hc(hc, off, BF16);
-    const float k = kv[off];
+    const float h = ld_hc(hc, (band + i) * hs + t, BF16);
+    const float k = kv[(band + i) * nb + t];
     sh = fmaf(h, h, sh);
     sk = fmaf(k, k, sk);
     dot = fmaf(h * w[band + i], k, dot);
@@ -51,7 +50,7 @@ __global__ void engram_gate_kernel(void* __restrict__ hc, const float* __restric
 
   // Pass two: the write. ONE value for every copy, each scaled by its own gate.
   for (uint32_t i = 0; i < n_embd; ++i) {
-    const size_t off = (band + i) * nb + t;
+    const size_t off = (band + i) * hs + t;
     st_hc(hc, off, ld_hc(hc, off, BF16) + gate * kv[(vband + i) * nb + t], BF16);
   }
 }
@@ -59,16 +58,16 @@ __global__ void engram_gate_kernel(void* __restrict__ hc, const float* __restric
 }  // namespace
 
 void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, uint32_t n_embd,
-                     uint32_t n_hc, uint32_t nb, float eps, void* stream) {
-  if (!hc || !kv || !w || !n_embd || !n_hc || !nb) return;
+                     uint32_t n_hc, uint32_t nb, uint32_t hc_stride, float eps, void* stream) {
+  if (!hc || !kv || !w || !n_embd || !n_hc || !nb || hc_stride < nb) return;
   const uint32_t thr = nb < 256u ? nb : 256u;
   const dim3 g(n_hc, (nb + thr - 1u) / thr), b(thr);
   if (hc_bf16)
     hipLaunchKernelGGL(engram_gate_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv, w, n_embd,
-                       n_hc, nb, eps);
+                       n_hc, nb, hc_stride, eps);
   else
     hipLaunchKernelGGL(engram_gate_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv, w, n_embd,
-                       n_hc, nb, eps);
+                       n_hc, nb, hc_stride, eps);
   AFF_HIP_CHECK(hipGetLastError());
 }
 
