@@ -167,6 +167,9 @@ with torch.no_grad():
         norm = M.RMSNorm(args.dim, args.norm_eps); norm.weight.data = load("norm.weight").float()
         W = load("head.weight").float()
         logits = torch.nn.functional.linear(norm(y)[:, -1], W)
+        if os.environ.get("REF_LOGITS_OUT"):
+            logits[0].float().numpy().astype("float32").tofile(os.environ["REF_LOGITS_OUT"])
+            print("wrote", os.environ["REF_LOGITS_OUT"], flush=True)
         top = torch.topk(logits[0], 5)
         try:
             names = [tk.decode([i]) for i in top.indices.tolist()]
