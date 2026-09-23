@@ -7,6 +7,7 @@
 #
 #   run.sh once   <image> <prompt-file> <n> [extra flags...]
 #   run.sh serve  <image> <name> [extra flags...]        # background, port 8099
+#                 for bench, add --max-tokens-floor 0 or max_tokens is raised to 256000
 #   run.sh bench  <prompt-file...>                       # against a running serve
 #
 # ⚠️ --security-opt label=disable is NOT optional on this SELinux host: without it the container's
@@ -56,7 +57,7 @@ case "$mode" in
       else echo "run.sh: no such prompt: $f (looked here and in $MODELS)" >&2; exit 2; fi
     done
     exec env URL="http://127.0.0.1:$PORT/v1/chat/completions" NGEN="${NGEN:-64}" \
-      python3 "$(dirname "$0")/bench_pp_tg.py" "${args[@]}"
+      python3 -u "$(dirname "$0")/bench_pp_tg.py" "${args[@]}"
     ;;
   *) echo "usage: run.sh once|serve|bench ..." >&2; exit 2 ;;
 esac

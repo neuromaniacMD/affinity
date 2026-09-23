@@ -30,6 +30,10 @@ def run(prompt, max_tokens):
         "stream": True,
         "stream_options": {"include_usage": True},
         "temperature": 0.0,
+        # The server defaults to thinking mode and to --max-tokens-floor 256000, and the two together
+        # turn "64 tokens" into "run to the end of the cache". Chat mode makes the budget the answer;
+        # the floor has to be switched off on the SERVER (run.sh serve ... --max-tokens-floor 0).
+        "thinking_mode": "chat",
     }
     req = urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json"})
     t0 = time.time()
@@ -58,6 +62,9 @@ def run(prompt, max_tokens):
     ctok = usage.get("completion_tokens") or n
     ttft = (first or end) - t0
     gen = end - (first or end)
+    if ctok > max_tokens + 4:
+        sys.exit(f"bench: asked for {max_tokens} tokens and got {ctok} -- the server is not honouring "
+                 "max_tokens. Serve with --max-tokens-floor 0.")
     return ptok, ctok, ttft, gen
 
 
