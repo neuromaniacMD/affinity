@@ -1,5 +1,29 @@
 # Affinity
 
+> ## This is a fork
+>
+> **Affinity is the work of Yoshi Exeler: [StillDeadcode/affinity](https://codeberg.org/StillDeadcode/affinity)
+> on Codeberg, MIT licensed.** The engine, its design and everything below this box are the original project's,
+> and this README is upstream's, unchanged. Please star, cite and report engine issues upstream.
+>
+> This fork adds, on top of upstream `a48b72e`:
+> - **`v4-fixes`** (default branch): robustness fixes for DeepSeek-V4-Flash and V4-Flash-0731, including the
+>   "fluent garbage after the first long prompt" bug. The fixes are offered upstream as Codeberg issue #6 and PRs #7–#11.
+> - **`v41`**: DeepSeek-V4.1-Flash support (indexer, engram, chat encoding), correct against the reference model.
+> - A Docker build on AMD's TheRock ROCm 7.14 (`docker/Dockerfile`) and measured results on two Radeon AI PRO R9700s.
+>
+> Details, commits and numbers: **[FORK.md](FORK.md)**.
+>
+> ### Prebuilt quantised model
+>
+> **[neuromaniacmd/DeepSeek-V4-Flash-0731-affinity-2.875bpw](https://huggingface.co/neuromaniacmd/DeepSeek-V4-Flash-0731-affinity-2.875bpw)** on Hugging Face is a ready-made affinity
+> container for [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731). It was made with
+> upstream's own `aff-quantize` exactly as in *3. Quantise* below: routed experts at 2.875 bpw with affinity's codebook
+> quant, weighted by the teamblobfish V4-Flash imatrix; dense weights in the checkpoint's FP8; plus 0731's bundled DSpark
+> draft. That saves the 149 GB checkpoint download and ~2.5 h of quantising. The main container is split into three
+> parts for the Hub's 50 GB file limit (reassemble with `cat`, checksums included). It loads only in affinity, not in
+> llama.cpp or vLLM. Measured on two R9700s: ~1.3K tok/s prefill, 35–50 tok/s decode, 262K context.
+
 An inference engine for DeepSeek-V4-Flash on **one or two** RDNA4 GPUs. Single C++/HIP codebase, no
 framework.
 
