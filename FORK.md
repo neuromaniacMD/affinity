@@ -31,6 +31,7 @@ poisoned before).
 | `a4f1fec` | engine: clear the compressor/indexer history rings on every sequence reset |
 | `1f00675` | gpu: check every kernel launch (`hipGetLastError`) |
 | `6dc42ae` | placement: swallowed HIP failures in the slab load are fatal (upstream PR #5) |
+| `df8dc70` | server: braces inside strings no longer split the message list (upstream PR #3). Before it, a tool result with an unbalanced `{` silently dropped every later message, and agents looped |
 | `9585712`, `921ca87`, `f369a38`, `a12ee7b`, `a473c28` | opt-in verifiers: `AFF_MALLOC_TRACE`, `AFF_WEIGHT_VERIFY`, `AFF_PLC_VERIFY`, `AFF_MOVE_VERIFY` |
 
 The first five are also offered upstream on Codeberg (issue #6, PRs #7–#11).
