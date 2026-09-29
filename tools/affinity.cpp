@@ -2614,7 +2614,11 @@ int main(int argc, char** argv) {
         open_think = false;
         streamed = te + think_end.size();
       }
-      if (saw_marker) return true;
+      // A tool call is withheld until it is complete, so nothing streams while its arguments are generated.
+      // An empty, not-done piece is a heartbeat: the server turns it into an SSE keep-alive comment when the
+      // stream has been silent too long. Without it a long call (a big `write`) exceeds a client's body-idle
+      // timeout (Node/undici: 300 s) and the client aborts the turn while the engine is still generating it.
+      if (saw_marker) return sink(std::string(), Delta::Content, false);
       // Hold back anything that might still become the tool-call marker. Without this the opening
       // "\n\n<" of a tool call is streamed as content and the client renders markup.
       const size_t at = raw.find(marker, streamed);

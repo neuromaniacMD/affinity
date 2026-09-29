@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
@@ -452,8 +453,22 @@ void Server::serve_one(int fd) {
     // The first chat delta of a stream carries the role and nothing else to say it opens an
     // assistant message; clients key the new message on it, and OpenAI itself sends it.
     bool opened = false;
+    // Last time anything was written to the stream. An empty, not-done piece is the generator's heartbeat
+    // while it withholds a tool call; after kKeepAlive of silence it becomes an SSE comment line, which
+    // every SSE/OpenAI client ignores but which resets a client's body-idle timer.
+    constexpr auto kKeepAlive = std::chrono::seconds(15);
+    auto last_send = std::chrono::steady_clock::now();
     gen_(r, [&](const std::string& piece, Delta chan, bool done) -> bool {
-      if (!alive || done || piece.empty()) return alive;
+      if (!alive || done) return alive;
+      if (piece.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_send >= kKeepAlive) {
+          alive = send_all(fd, ": keep-alive\n\n", 14);
+          last_send = now;
+        }
+        return alive;
+      }
+      last_send = std::chrono::steady_clock::now();
       std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + model_name_ +
                       "\",\"choices\":[{\"index\":0,";
       if (is_chat) {
