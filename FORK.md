@@ -132,6 +132,12 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt label=disable
 ```
 
 - `--security-opt label=disable` is required on SELinux hosts, or the model read is denied.
+- Two cards need working GPU peer access (P2P), because the all-reduce writes straight into the other card's memory. If the
+  driver refuses peer access, the server stops at startup and names the pair. The worse case is a platform that grants
+  it and then fails under load. One user reported a hard reset on the first request with two R9700s behind a PCIe switch
+  on an EPYC Milan board (reset reason `0x08000800`, "data fabric sync flood"). Not reproduced here, where both cards
+  sit on CPU root ports of an AM5 (X670E) board. If the first request crashes or resets the machine, move the cards to
+  CPU-attached slots or run one card with `--gpus 1`.
 - `--kv-commit` equal to `--kv-size` backs the whole context at load. Growing it mid-request instead comes out of
   the small driver reserve.
 - Thinking is on by default, and the server raises any request's `max_tokens` to at least 256,000 so reasoning
