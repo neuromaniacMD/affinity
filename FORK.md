@@ -32,6 +32,7 @@ poisoned before).
 | `1f00675` | gpu: check every kernel launch (`hipGetLastError`) |
 | `6dc42ae` | placement: swallowed HIP failures in the slab load are fatal (upstream PR #5) |
 | `df8dc70` | server: braces inside strings no longer split the message list (upstream PR #3). Before it, a tool result with an unbalanced `{` silently dropped every later message, and agents looped |
+| `ee62896` | server: SSE `: keep-alive` comments while a tool call is withheld. Tool calls are sent in one chunk once complete, so a long one (a ~10K-token `write`) streamed nothing for >300 s and Node's `fetch` (undici body timeout, 300 s) aborted the turn (`terminated`) while the engine was still generating it. Verified on a real agent run: a 10,091-token `write` generated silently for ~308 s arrived intact |
 | `9585712`, `921ca87`, `f369a38`, `a12ee7b`, `a473c28` | opt-in verifiers: `AFF_MALLOC_TRACE`, `AFF_WEIGHT_VERIFY`, `AFF_PLC_VERIFY`, `AFF_MOVE_VERIFY` |
 
 The first five are also offered upstream on Codeberg (issue #6, PRs #7–#11).
